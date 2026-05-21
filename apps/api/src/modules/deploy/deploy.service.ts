@@ -49,7 +49,7 @@ type PublishedPort = {
 };
 
 type DockerRunPlan = {
-  method: 'docker_run' | 'docker_compose' | 'binary_service';
+  method: 'docker_run' | 'docker_compose' | 'static_site' | 'binary_service';
   containerName: string;
   image: string;
   publishMode: 'reverse_proxy' | 'public_domain_reverse_proxy';
@@ -276,7 +276,7 @@ function isDockerDaemonUnavailable(message: string) {
 }
 
 function resolvedDeployInput(parsed: ParsedDeployInput, plan: {
-  method: 'docker_run' | 'docker_compose' | 'binary_service';
+  method: 'docker_run' | 'docker_compose' | 'static_site' | 'binary_service';
   hostPort: number | null;
   containerPort: number;
   appPayload: DockerRunPlan['appPayload'];
@@ -1158,6 +1158,123 @@ async function mountRequirement(mount: HostMount): Promise<DeployPermissionRequi
   }
 }
 
+function staticSiteRootFromCommand(command: string) {
+  const value = command.trim();
+
+  if (!value) {
+    throw new DeployInputError('Enter the built static site folder.');
+  }
+
+  const unquoted =
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+      ? value.slice(1, -1)
+      : value;
+
+  return expandHostPath(unquoted);
+}
+
+function staticSiteNameFromRoot(siteRoot: string) {
+  const leaf = path.basename(siteRoot);
+  const parent = path.basename(path.dirname(siteRoot));
+
+  return ['build', 'dist', 'html', 'out', 'public', 'site', 'www'].includes(leaf.toLowerCase())
+    ? parent || leaf || 'Static site'
+    : leaf || 'Static site';
+}
+
+async function resolveStaticSiteRoot(command: string) {
+  const root = staticSiteRootFromCommand(command);
+
+  try {
+    const stat = await fs.stat(root);
+
+    if (!stat.isDirectory()) {
+      throw new DeployInputError(`Static site path must be a directory: ${root}`);
+    }
+
+    await fs.access(root, fsConstants.R_OK);
+    return root;
+  } catch (error) {
+    if (error instanceof DeployInputError) {
+      throw error;
+    }
+
+    if (isNodeError(error) && error.code === 'ENOENT') {
+      throw new DeployInputError(`Static site folder was not found: ${root}`);
+    }
+
+    if (isNodeError(error) && (error.code === 'EACCES' || error.code === 'EPERM')) {
+      throw new DeployRuntimeUnavailableError(
+        `Static site folder "${root}" is not readable by The Containers.`
+      );
+    }
+
+    throw error;
+  }
+}
+
+async function staticSiteRequirement(command: string): Promise<DeployPermissionRequirement> {
+  const root = staticSiteRootFromCommand(command);
+
+  try {
+    const stat = await fs.stat(root);
+
+    if (!stat.isDirectory()) {
+      return {
+        id: `static-site-not-directory-${root}`,
+        label: 'Static site folder',
+        status: 'blocked',
+        userHelpRequired: true,
+        detail: `${root} exists, but it is not a directory.`,
+        commands: [`ls -la ${shellQuote(root)}`]
+      };
+    }
+
+    await fs.access(root, fsConstants.R_OK);
+
+    return {
+      id: `static-site-ready-${root}`,
+      label: 'Static site folder',
+      status: 'ready',
+      userHelpRequired: false,
+      detail: `${root} is readable and will be mounted read-only into nginx.`,
+      commands: []
+    };
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') {
+      return {
+        id: `static-site-missing-${root}`,
+        label: 'Static site folder',
+        status: 'blocked',
+        userHelpRequired: true,
+        detail: `${root} does not exist. Build the site first, then point Static site deployment at the output folder.`,
+        commands: [`ls -la ${shellQuote(path.dirname(root))}`]
+      };
+    }
+
+    if (isNodeError(error) && (error.code === 'EACCES' || error.code === 'EPERM')) {
+      return {
+        id: `static-site-permission-${root}`,
+        label: 'Static site folder',
+        status: 'blocked',
+        userHelpRequired: true,
+        detail: `${root} exists but The Containers cannot read it.`,
+        commands: fixPathPermissionCommands(root)
+      };
+    }
+
+    return {
+      id: `static-site-unknown-${root}`,
+      label: 'Static site folder',
+      status: 'blocked',
+      userHelpRequired: true,
+      detail: commandDetail(error),
+      commands: []
+    };
+  }
+}
+
 async function portRequirement(port: number | null): Promise<DeployPermissionRequirement> {
   if (!port) {
     return {
@@ -1469,6 +1586,23 @@ async function commandPermissionRequirements(input: unknown) {
           : serviceKind === 'launchd_user'
             ? ['launchctl print gui/$(id -u)']
             : []
+      });
+      return requirements;
+    }
+
+    if (parsedInput.method === 'static_site') {
+      const containerPort = parsedInput.containerPort ?? 80;
+      const requestedHostPort = parsedInput.hostPort ?? null;
+
+      requirements.push(await portRequirement(requestedHostPort));
+      requirements.push(await staticSiteRequirement(command));
+      requirements.push({
+        id: 'static-site-container',
+        label: 'Static web server',
+        status: 'auto',
+        userHelpRequired: false,
+        detail: `The Containers will run nginx and serve the selected folder on container port ${containerPort}.`,
+        commands: []
       });
       return requirements;
     }
@@ -3248,11 +3382,10 @@ export class DeployService {
         {
           id: 'static_site',
           name: 'Static site build',
-          status: 'planned',
+          status: 'available',
           capabilities: [
-            'npm-build',
-            'pnpm-build',
-            'bun-build',
+            'existing-dist-folder',
+            'read-only-mount',
             'static-serve',
             'reverse-proxy'
           ]
@@ -3455,6 +3588,33 @@ export class DeployService {
       };
     }
 
+    if (doctorMethod === 'static_site') {
+      const command = parsedDoctorInput.success
+        ? parsedDoctorInput.data.command?.trim() || ''
+        : '';
+
+      if (!command) {
+        checks.push({
+          id: 'static-site-folder',
+          label: 'Static site folder',
+          status: 'fail',
+          detail: 'Enter the built static site folder before checking deploy readiness.'
+        });
+
+        return {
+          ok: false,
+          dockerBin,
+          dockerHost: process.env.DOCKER_HOST ?? null,
+          dockerConfig: process.env.DOCKER_CONFIG ?? null,
+          platform: process.platform,
+          checks,
+          requirements,
+          userHelpRequired: true,
+          grantSteps
+        };
+      }
+    }
+
     checks.push({
       id: 'docker-bin-config',
       label: 'Docker binary setting',
@@ -3627,7 +3787,10 @@ export class DeployService {
     } catch (error) {
       const detail = commandDetail(error);
 
-      if (plan.method !== 'docker_run' || !isContainerNameConflict(detail)) {
+      if (
+        (plan.method !== 'docker_run' && plan.method !== 'static_site') ||
+        !isContainerNameConflict(detail)
+      ) {
         if (plan.method === 'binary_service') {
           await removeBinaryService(plan.containerName, plan.resolvedDeployInput).catch(() => undefined);
         }
@@ -3664,6 +3827,13 @@ export class DeployService {
           resourceName: plan.containerName,
           deployInput: plan.resolvedDeployInput
         });
+        created = {
+          ...created,
+          app: {
+            ...created.app,
+            managedDeployment: true
+          }
+        };
       }
     } catch (error) {
       if (!adoptedExistingContainer) {
@@ -4468,6 +4638,10 @@ export class DeployService {
       return this.buildComposePlan(parsed, allocateHostPort);
     }
 
+    if (parsed.method === 'static_site') {
+      return this.buildStaticSitePlan(parsed, allocateHostPort);
+    }
+
     if (parsed.method === 'binary_service') {
       return this.buildBinaryServicePlan(parsed, allocateHostPort);
     }
@@ -4696,6 +4870,89 @@ export class DeployService {
         ...(hostNetwork
           ? ['Host network mode detected; ports will not be injected into the Compose file.']
           : []),
+        ...(parsed.publishMode === 'public_domain_reverse_proxy'
+          ? [
+              'Public domain mode requires DNS to point to this machine and Caddy to receive public traffic.'
+            ]
+          : [
+              'Reverse proxy mode will bind the host in Caddy; DNS must resolve to this machine for clients to reach it.'
+            ])
+      ]
+    };
+  }
+
+  private async buildStaticSitePlan(
+    parsed: z.infer<typeof deployInputSchema>,
+    allocateHostPort: boolean
+  ): Promise<DockerRunPlan> {
+    const siteRoot = await resolveStaticSiteRoot(parsed.command);
+    const containerPort = parsed.containerPort ?? 80;
+    const requestedHostPort = parsed.hostPort ?? null;
+    const warnings: string[] = [];
+    const hostPort = allocateHostPort
+      ? await resolveHostPort(requestedHostPort, warnings)
+      : requestedHostPort;
+    const baseName = parsed.name ?? staticSiteNameFromRoot(siteRoot);
+    const containerName = slugify(baseName) || 'static-site';
+    const routeMode = parsed.routeMode;
+    const publicPath =
+      routeMode === 'subpath'
+        ? parsed.publicPath ?? `/${slugify(containerName) || 'app'}`
+        : null;
+    const targetUrl = `http://127.0.0.1:${hostPort ?? requestedHostPort ?? containerPort}`;
+    const appPayload = {
+      name: baseName,
+      iconType: 'builtin' as const,
+      iconValue: null,
+      targetUrl,
+      routeMode,
+      publicHost: parsed.publicHost,
+      publicPath,
+      enabled: parsed.enabled,
+      sortOrder: 0,
+      category: parsed.category ?? 'Static sites',
+      tags: parsed.tags,
+      favorite: parsed.favorite
+    };
+    const image = 'nginx:alpine';
+    const dockerArgs = [
+      'run',
+      '-d',
+      '--name',
+      containerName,
+      '-p',
+      `${hostPort ?? requestedHostPort ?? containerPort}:${containerPort}`,
+      '-v',
+      `${siteRoot}:/usr/share/nginx/html:ro`,
+      image
+    ];
+    const hasIndex = await fileExists(path.join(siteRoot, 'index.html'));
+
+    return {
+      method: 'static_site',
+      containerName,
+      image,
+      publishMode: parsed.publishMode,
+      hostPort,
+      containerPort,
+      protocol: 'tcp',
+      targetUrl,
+      hostMounts: [],
+      appPayload,
+      dockerArgs,
+      resolvedDeployInput: resolvedDeployInput(parsed, {
+        method: 'static_site',
+        hostPort,
+        containerPort,
+        appPayload
+      }),
+      warnings: [
+        ...warnings,
+        `Static files from ${siteRoot} will be mounted read-only into nginx.`,
+        'Docker must be able to access this host folder. If nginx returns 403 or an empty directory, move the built files under a Docker-shared path or update Docker file sharing settings.',
+        ...(hasIndex
+          ? []
+          : ['No index.html was found at the static site root; directory requests may return 403.']),
         ...(parsed.publishMode === 'public_domain_reverse_proxy'
           ? [
               'Public domain mode requires DNS to point to this machine and Caddy to receive public traffic.'

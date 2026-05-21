@@ -144,7 +144,7 @@ export type DeployPayload = {
 };
 
 export type DeployPlan = {
-  method: 'docker_run' | 'docker_compose' | 'binary_service';
+  method: 'docker_run' | 'docker_compose' | 'static_site' | 'binary_service';
   containerName: string;
   image: string;
   publishMode: DeployPayload['publishMode'];

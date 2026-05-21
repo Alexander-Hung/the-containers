@@ -113,8 +113,8 @@ const deployMethods: Array<{
   {
     id: 'static_site',
     title: 'Static site',
-    detail: 'Build and serve dist output',
-    status: 'planned'
+    detail: 'Serve an existing dist folder',
+    status: 'available'
   },
   {
     id: 'node_app',
@@ -1188,6 +1188,18 @@ export function Admin({ onBack, openDeploySignal = 0 }: Props) {
         };
       }
 
+      if (method === 'static_site') {
+        return {
+          ...current,
+          method,
+          command: current.method === 'static_site' ? current.command : '',
+          name: current.method === 'static_site' ? current.name : '',
+          hostPort: current.method === 'static_site' ? current.hostPort : null,
+          containerPort: current.method === 'static_site' ? current.containerPort : null,
+          category: current.category || 'Static sites'
+        };
+      }
+
       return {
         ...current,
         method
@@ -1741,6 +1753,8 @@ export function Admin({ onBack, openDeploySignal = 0 }: Props) {
       ? 'This command needs user review because it requests host-level access. Deploy it and create a public route?'
       : deployForm.method === 'binary_service'
         ? 'Start this binary service and create a public route?'
+        : deployForm.method === 'static_site'
+          ? 'Serve this static folder and create a public route?'
         : 'Deploy this Docker container and create a public route?';
 
     if (!window.confirm(confirmation)) {
@@ -2621,6 +2635,8 @@ export function Admin({ onBack, openDeploySignal = 0 }: Props) {
                       ? 'Compose file'
                       : deployForm.method === 'binary_service'
                         ? 'Binary service command'
+                        : deployForm.method === 'static_site'
+                          ? 'Static folder path'
                         : `${selectedDeployMethod.title} input`}
                 </label>
                 <textarea
@@ -2635,6 +2651,8 @@ export function Admin({ onBack, openDeploySignal = 0 }: Props) {
                         ? 'services:\n  app:\n    image: nginx:alpine\n    ports:\n      - "8080:80"'
                         : deployForm.method === 'binary_service'
                           ? '/usr/local/bin/my-service --port 8080'
+                          : deployForm.method === 'static_site'
+                            ? '/srv/sites/my-app/dist'
                           : 'This deploy method is planned'
                   }
                   disabled={selectedDeployMethod.status !== 'available'}
@@ -2642,6 +2660,11 @@ export function Admin({ onBack, openDeploySignal = 0 }: Props) {
                 {deployForm.method === 'binary_service' ? (
                   <p className="mt-1 text-xs text-black/50 dark:text-[#a9bbb4]">
                     The command or service config must listen on the Service web port. The Containers verifies that port after start.
+                  </p>
+                ) : null}
+                {deployForm.method === 'static_site' ? (
+                  <p className="mt-1 text-xs text-black/50 dark:text-[#a9bbb4]">
+                    Point to an already-built folder such as dist, build, or public. The folder is mounted read-only into nginx.
                   </p>
                 ) : null}
               </div>
@@ -2821,7 +2844,7 @@ export function Admin({ onBack, openDeploySignal = 0 }: Props) {
                 {deployForm.method === 'binary_service' ? null : (
                   <div>
                     <label className="label" htmlFor="deployContainerPort">
-                      Container port
+                      {deployForm.method === 'static_site' ? 'Nginx port' : 'Container port'}
                     </label>
                     <input
                       id="deployContainerPort"
@@ -2836,7 +2859,7 @@ export function Admin({ onBack, openDeploySignal = 0 }: Props) {
                           event.target.value ? Number(event.target.value) : null
                         )
                       }
-                      placeholder="From -p"
+                      placeholder={deployForm.method === 'static_site' ? '80' : 'From -p'}
                     />
                   </div>
                 )}

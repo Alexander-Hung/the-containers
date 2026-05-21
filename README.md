@@ -16,6 +16,7 @@ Available now:
 - DNS diagnostics for route and public domain checks.
 - Docker run deployments with command parsing, automatic port assignment, permission checks, and managed cleanup.
 - Docker Compose deployments with YAML parsing, web service selection, port inference, bind mount checks, host network handling, and managed cleanup.
+- Static site deployments for already-built folders, served through a managed nginx container with read-only mounts.
 - Binary/service deployments for local HTTP services, installed as user systemd services on Linux or launchd agents on macOS.
 - Host permission panel for Docker CLI, Docker daemon, Compose runtime, bind mounts, privileged containers, capabilities, devices, host networking, Docker socket mounts, public domain DNS, and Caddy sync.
 - Managed deployment records. Apps deployed by The Containers are marked as managed and are cleaned up when deleted.
@@ -27,7 +28,7 @@ Available now:
 Planned:
 
 - GitHub auto-detect deployments.
-- Static site deployments.
+- Static site build steps from source repositories.
 - Node.js app deployments.
 - Python app deployments.
 - Advanced custom command deployments.
@@ -117,11 +118,12 @@ The Containers can deploy from:
 
 - `docker run` commands
 - Docker Compose YAML
+- built static site folders
 - Binary/service commands for local HTTP services
 
 The deploy flow is:
 
-1. Paste a Docker command, Compose file, or Binary/service command.
+1. Paste a Docker command, Compose file, static folder path, or Binary/service command.
 2. The Containers auto-fills app name, route host, and ports when possible.
 3. Review Host permission checks.
 4. Preview the deployment plan.

@@ -6,6 +6,10 @@ This project follows [Semantic Versioning](https://semver.org/) while it is publ
 
 ## [Unreleased]
 
+### Added
+
+- Static site deployment for already-built folders through a managed nginx container with read-only static file mounts.
+
 ## [0.4.1] - 2026-05-14
 
 ### Fixed
