@@ -136,6 +136,8 @@ Linux Binary/service deployments require a working user systemd bus for the user
 
 When a managed app is deleted, The Containers attempts to remove the related Docker container, Compose project, or local service and free the route.
 
+App imports replace the app list by ID, preserving managed deployment records for retained IDs. An import that omits a managed app is rejected without changing the app list; include that app in the import or delete it through the managed app delete flow first. Omitted unmanaged apps are removed. App imports do not restore deployment metadata; use backup restore for that. Backup restore accepts only `docker`, `docker_compose`, and `binary_service` deployment providers and rejects missing or unknown providers.
+
 ## Managed Deployment Operations
 
 Apps deployed by The Containers receive a `Self-Host` badge and a managed deployment record. From the Admin app details view, managed apps can be:
