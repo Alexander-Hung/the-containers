@@ -629,36 +629,195 @@ async function writeBackupFilesToRoot(root: string, files: BackupFile[], warning
   return files.length;
 }
 
-async function restoreNamedVolume(name: string, files: BackupFile[], warnings: string[]) {
-  const tmpRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'the-containers-volume-restore-')));
-  const helperName = `the-containers-restore-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  try {
-    await writeBackupFilesToRoot(tmpRoot, files, warnings);
-    await runDocker(['volume', 'create', name]);
-    try {
-      await runDocker(['create', '--name', helperName, '-v', `${name}:/restore`, 'busybox:latest', 'sh']);
-    } catch {
-      await runDocker(['pull', 'busybox:latest']);
-      await runDocker(['create', '--name', helperName, '-v', `${name}:/restore`, 'busybox:latest', 'sh']);
-    }
-    await runDocker(['cp', '-a', `${tmpRoot}${path.sep}.`, `${helperName}:/restore`]);
-    return files.length;
-  } finally {
-    await runDocker(['rm', '-f', helperName]).catch(() => undefined);
-    await fs.rm(tmpRoot, { recursive: true, force: true }).catch(() => undefined);
-  }
-}
+type StagedHostFile = {
+  target: string;
+  directory: string;
+  originalMoved: boolean;
+  installed: boolean;
+};
+type StagedVolume = { name: string; helper: string; directory: string; files: BackupFile[]; ready: boolean };
 
-async function restoreDockerDataArchives(archives: RestoreManifest['dockerDataArchives'], warnings: string[]) {
-  let restored = 0;
-  for (const archive of archives) {
-    if (!archive.files.length) continue;
-    // Never fall back from a named volume to an arbitrary host source path.
-    restored += archive.type === 'volume'
-      ? await restoreNamedVolume(archive.name!, archive.files, warnings)
-      : await writeBackupFilesToRoot(archive.source, archive.files, warnings);
+// Runs in the helper with positional arguments, never interpolated archive paths.
+// Journal entries and originals live on the destination filesystem, so each
+// replacement and its undo use rename rather than an in-place overwrite.
+const volumeFileStep = `
+set -eu
+phase=$1; root=$2; work=$3; shift 3
+safe_target() {
+  current=$root
+  remaining=$1
+  while :; do
+    component=\${remaining%%/*}
+    current=$current/$component
+    [ ! -L "$current" ] || { echo "Symlink destination: $current" >&2; exit 1; }
+    if [ "$remaining" = "$component" ]; then
+      if [ -e "$current" ]; then
+        [ -f "$current" ] && [ "$(stat -c %h "$current")" = 1 ] || exit 1
+      fi
+      break
+    fi
+    [ ! -e "$current" ] || [ -d "$current" ] || exit 1
+    remaining=\${remaining#*/}
+  done
+}
+i=0
+while [ "$#" -gt 0 ]; do
+  relative=$1; ownership=$2; shift 2
+  entry=$work/$i
+  target=$root/$relative
+  case "$phase" in
+    stage)
+      safe_target "$relative"
+      mkdir -p "\${target%/*}"
+      mkdir "$entry"
+      # Preflight destination-directory writes on the same filesystem.
+      probe=$(mktemp "\${target%/*}/.restore-probe.XXXXXX")
+      rm "$probe"
+      if [ ! -e "$target" ]; then
+        touch "$entry/absent"
+      elif [ "$ownership" = preserve ]; then
+        chown "$(stat -c %u "$target"):$(stat -c %g "$target")" "$work/new/$relative" ||
+          echo "Could not preserve ownership for $target" >&2
+      fi
+      ;;
+    apply)
+      safe_target "$relative"
+      if [ -e "$target" ]; then mv "$target" "$entry/original"; fi
+      mv "$work/new/$relative" "$target"
+      ;;
+    rollback)
+      safe_target "$relative"
+      if [ -e "$entry/original" ]; then
+        mv "$entry/original" "$target"
+      elif [ -e "$entry/absent" ] && [ ! -e "$work/new/$relative" ]; then
+        rm -f "$target"
+      fi
+      ;;
+  esac
+  i=$((i + 1))
+done
+`;
+
+class RestoreFilesTransaction {
+  private hosts: StagedHostFile[] = [];
+  private volumes: StagedVolume[] = [];
+  private localTemps: string[] = [];
+
+  constructor(private warnings: string[]) {}
+
+  async stage(body: RestoreManifest) {
+    const targets = new Map<string, BackupFile>();
+    for (const file of body.deploymentFiles) targets.set(path.resolve(config.deploymentsPath, file.path), file);
+    for (const file of body.dockerProjectFiles) targets.set(path.resolve(file.absolutePath), file);
+    for (const archive of body.dockerDataArchives.filter((archive) => archive.type === 'bind')) {
+      for (const file of archive.files) targets.set(path.resolve(archive.source, file.path), file);
+    }
+    for (const [target, file] of targets) {
+      await validateHostTarget(target);
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await validateHostTarget(target);
+      const directory = await fs.mkdtemp(path.join(path.dirname(target), '.the-containers-restore-'));
+      this.hosts.push({ target, directory, originalMoved: false, installed: false });
+      const previous = await fs.lstat(target).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      await writeBackupFile(path.join(directory, 'new'), {
+        ...file,
+        // Rename replaces the inode: explicitly preserve legacy ownership.
+        uid: file.uid !== undefined && file.gid !== undefined ? file.uid : previous?.uid,
+        gid: file.uid !== undefined && file.gid !== undefined ? file.gid : previous?.gid
+      }, this.warnings);
+    }
+    // Stage every volume's payload without copying over its live files.
+    for (const archive of body.dockerDataArchives.filter((archive) => archive.type === 'volume' && archive.files.length)) {
+      const tmp = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'the-containers-volume-restore-')));
+      this.localTemps.push(tmp);
+      await writeBackupFilesToRoot(tmp, archive.files, this.warnings);
+      const suffix = randomBytes(12).toString('hex');
+      const volume: StagedVolume = {
+        name: archive.name!, helper: `the-containers-restore-${suffix}`,
+        directory: `/restore/.the-containers-restore-${suffix}`, files: archive.files, ready: false
+      };
+      this.volumes.push(volume);
+      await runDocker(['volume', 'create', volume.name]);
+      const create = ['create', '--name', volume.helper, '-v', `${volume.name}:/restore`,
+        '--entrypoint', 'sh', 'busybox:latest', '-c', 'while :; do sleep 3600; done'];
+      try { await runDocker(create); }
+      catch {
+        await runDocker(['pull', 'busybox:latest']);
+        await runDocker(create);
+      }
+      await runDocker(['start', volume.helper]);
+      await runDocker(['exec', volume.helper, 'mkdir', volume.directory]);
+      await runDocker(['exec', volume.helper, 'mkdir', `${volume.directory}/new`]);
+      await runDocker(['cp', '-a', `${tmp}${path.sep}.`, `${volume.helper}:${volume.directory}/new`]);
+      await this.volumeStep(volume, 'stage');
+      volume.ready = true;
+    }
   }
-  return restored;
+
+  private async volumeStep(volume: StagedVolume, phase: string) {
+    const { stderr } = await runDocker(['exec', volume.helper, 'sh', '-c', volumeFileStep, 'restore-files',
+      phase, '/restore', volume.directory, ...volume.files.flatMap((file) => [
+        path.posix.normalize(file.path), file.uid !== undefined && file.gid !== undefined ? 'archive' : 'preserve'
+      ])]);
+    if (stderr.trim()) this.warnings.push(stderr.trim());
+  }
+
+  async apply() {
+    for (const entry of this.hosts) {
+      await validateHostTarget(entry.target);
+      try {
+        await fs.rename(entry.target, path.join(entry.directory, 'original'));
+        entry.originalMoved = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      await fs.rename(path.join(entry.directory, 'new'), entry.target);
+      entry.installed = true;
+    }
+    for (const volume of this.volumes) await this.volumeStep(volume, 'apply');
+  }
+
+  async rollback() {
+    const failures: string[] = [];
+    for (const volume of [...this.volumes].reverse()) {
+      if (!volume.ready) continue;
+      try { await this.volumeStep(volume, 'rollback'); }
+      catch (error) { failures.push(`volume:${volume.name}: ${String(error)}; originals: ${volume.directory}`); }
+    }
+    for (const entry of [...this.hosts].reverse()) {
+      try {
+        await validateHostTarget(entry.target);
+        if (entry.originalMoved) await fs.rename(path.join(entry.directory, 'original'), entry.target);
+        else if (entry.installed) await fs.unlink(entry.target);
+      } catch (error) { failures.push(`${entry.target}: ${String(error)}; originals: ${entry.directory}`); }
+    }
+    return failures;
+  }
+
+  async cleanup(keepOriginals = false) {
+    // A failed rollback must leave its journal/originals available for recovery.
+    for (const volume of this.volumes) {
+      if (!keepOriginals) {
+        await runDocker(['exec', volume.helper, 'rm', '-rf', volume.directory])
+          .catch((error) => this.warnings.push(`Could not clean volume staging ${volume.name}:${volume.directory}: ${String(error)}`));
+      }
+      await runDocker(['rm', '-f', volume.helper])
+        .catch((error) => this.warnings.push(`Could not remove restore helper ${volume.helper}: ${String(error)}`));
+    }
+    if (!keepOriginals) {
+      for (const entry of this.hosts) {
+        await fs.rm(entry.directory, { recursive: true, force: true })
+          .catch((error) => this.warnings.push(`Could not clean staging ${entry.directory}: ${String(error)}`));
+      }
+    }
+    for (const tmp of this.localTemps) {
+      await fs.rm(tmp, { recursive: true, force: true })
+        .catch((error) => this.warnings.push(`Could not clean staging ${tmp}: ${String(error)}`));
+    }
+  }
 }
 
 function extractBackupBody(input: unknown) {
@@ -757,7 +916,10 @@ export async function registerBackupRoutes(
     }
   });
 
+  let restoring = false;
   app.post('/api/backup/restore', { bodyLimit: restoreBodyLimit }, async (request, reply) => {
+    if (restoring) return reply.code(409).send({ message: 'Another backup restore is in progress' });
+    restoring = true;
     const rawBody = extractBackupBody(request.body);
     try {
       const { manifest: body, destinations } = await validateRestoreManifest(rawBody, appsService);
@@ -769,31 +931,52 @@ export async function registerBackupRoutes(
         }
         confirmations.delete(token as string);
       }
-      const result = await appsService.restoreBackup({
-        apps: body.apps,
-        deployments: body.deployments,
-        settings: body.settings,
-        settingsService,
-        adminTokenConfigured: Boolean(config.adminToken)
-      });
       const warnings: string[] = [];
       const allFiles = [...body.deploymentFiles, ...body.dockerProjectFiles, ...body.dockerDataArchives.flatMap((archive) => archive.files)];
       if (allFiles.some((file) => file.mode === undefined || file.uid === undefined || file.gid === undefined)) {
         warnings.push('Some files have no permission or ownership metadata (legacy backup); missing modes default to 0600 and missing ownership is unchanged (new files belong to the service user).');
       }
-      const deploymentFiles = await writeBackupFilesToRoot(config.deploymentsPath, body.deploymentFiles, warnings);
-      for (const file of body.dockerProjectFiles) await writeBackupFile(path.resolve(file.absolutePath), file, warnings);
+      const files = new RestoreFilesTransaction(warnings);
+      let result: Awaited<ReturnType<AppsService['restoreBackup']>>;
+      try {
+        await files.stage(body);
+        await files.apply();
+        result = await appsService.restoreBackup({
+          apps: body.apps,
+          deployments: body.deployments,
+          settings: body.settings,
+          settingsService,
+          adminTokenConfigured: Boolean(config.adminToken)
+        });
+      } catch (error) {
+        const rollbackErrors = await files.rollback();
+        await files.cleanup(rollbackErrors.length > 0);
+        const status = rollbackErrors.length ? 500 : error instanceof ZodError || error instanceof InvalidBackupError
+          ? 400 : error instanceof AppConflictError ? 409 : 500;
+        return reply.code(status).send({
+          message: error instanceof Error ? error.message : String(error),
+          restore: { database: 'unchanged', files: rollbackErrors.length ? 'partial' : 'rolled_back', rollbackErrors },
+          warnings
+        });
+      }
+      await files.cleanup();
+      const deploymentFiles = body.deploymentFiles.length;
       const dockerProjectFiles = body.dockerProjectFiles.length;
-      const dockerDataFiles = await restoreDockerDataArchives(body.dockerDataArchives, warnings);
-      auditService.record({
-        action: 'backup.restore',
-        targetType: 'backup',
-        summary: `Restored ${body.apps.length} apps, ${deploymentFiles} deployment files, ${dockerProjectFiles} Docker project files, and ${dockerDataFiles} Docker data files`,
-        sourceIp: request.ip
-      });
+      const dockerDataFiles = body.dockerDataArchives.reduce((sum, archive) => sum + archive.files.length, 0);
+      try {
+        auditService.record({
+          action: 'backup.restore',
+          targetType: 'backup',
+          summary: `Restored ${body.apps.length} apps, ${deploymentFiles} deployment files, ${dockerProjectFiles} Docker project files, and ${dockerDataFiles} Docker data files`,
+          sourceIp: request.ip
+        });
+      } catch (error) {
+        warnings.push(`Restore committed, but audit recording failed: ${String(error)}`);
+      }
 
       return {
         ...result,
+        restore: { database: 'committed', files: 'committed' },
         deploymentFiles,
         dockerProjectFiles,
         dockerDataFiles,
@@ -815,6 +998,8 @@ export async function registerBackupRoutes(
       }
 
       throw error;
+    } finally {
+      restoring = false;
     }
   });
 

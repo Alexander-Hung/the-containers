@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import dns from 'node:dns/promises';
@@ -104,6 +105,7 @@ type DockerInspectContainer = {
     Running?: boolean;
     Status?: string;
   };
+  Mounts?: Array<{ Type?: string; Name?: string; Destination?: string; RW?: boolean }>;
   NetworkSettings?: {
     Ports?: Record<string, DockerInspectPort>;
   };
@@ -698,6 +700,51 @@ async function inspectContainer(containerName: string) {
   }
 
   return container;
+}
+
+// Walk Docker options only: command arguments after the image must remain literal.
+function replacementCreateArgs(plan: DockerRunPlan, name: string, container: DockerInspectContainer | null) {
+  const volumes = new Map((container?.Mounts ?? [])
+    .filter((mount) => mount.Type === 'volume' && mount.Name && mount.Destination)
+    .map((mount) => [mount.Destination!, mount]));
+  const args = ['create', '--name', name];
+  const options = plan.dockerArgs.slice(4); // run -d --name <name>
+  for (let index = 0; index < options.length; index++) {
+    const token = options[index];
+    if (!token.startsWith('-')) {
+      for (const [destination, mount] of volumes) {
+        args.push('-v', `${mount.Name}:${destination}:${mount.RW === false ? 'ro' : 'rw'}`);
+      }
+      args.push(...options.slice(index));
+      break;
+    }
+    const option = optionName(token);
+    const inline = optionInlineValue(token);
+    const takesValue = optionValueNames.has(option) ||
+      (token.length === 2 && shortOptionsWithValues.has(token[1]));
+    const value = inline ?? (takesValue ? options[++index] : undefined);
+    if ((option === '-v' || option === '--volume') && value) {
+      const parts = value.split(':');
+      // Anonymous syntax is /destination[:options]; named and bind syntax has a source.
+      const anonymous = parts.length === 1 || (parts.length === 2 && !parts[1].startsWith('/'));
+      const destination = anonymous ? parts[0] : parts[1];
+      const mount = volumes.get(destination);
+      args.push(option, anonymous && mount ? `${mount.Name}:${value}` : value);
+      volumes.delete(destination);
+    } else if (option === '--mount' && value) {
+      const fields = value.split(',');
+      const destination = fields.find((field) => /^(target|dst|destination)=/.test(field))?.split('=')[1];
+      const mount = destination ? volumes.get(destination) : undefined;
+      const anonymous = !fields.some((field) => /^(source|src)=/.test(field)) &&
+        !fields.some((field) => /^type=(?!volume$)/.test(field));
+      args.push(option, anonymous && mount ? `${value},source=${mount.Name}` : value);
+      if (destination) volumes.delete(destination);
+    } else {
+      args.push(token);
+      if (inline === null && takesValue) args.push(value!);
+    }
+  }
+  return args;
 }
 
 function firstPublishedPort(container: DockerInspectContainer, containerPort: number) {
@@ -4057,17 +4104,56 @@ export class DeployService {
       const plan = await this.buildPlan(deployment.deployInput, false);
       await ensureHostMountsWritable(plan.hostMounts);
       await runDockerCommand(['pull', plan.image], { timeout: 240_000 });
-      await runDockerCommand(['rm', '-fv', deployment.resourceName]).catch(() => undefined);
-      const { stdout } = await runDockerCommand(plan.dockerArgs, { timeout: 240_000 });
-
-      this.repo.updateRuntime({
-        appId,
-        resourceId: stdout.trim(),
-        resourceName: plan.containerName,
-        deployInput: plan.resolvedDeployInput
-      });
-
-      return this.managedDeploymentStatus(appId);
+      let original: DockerInspectContainer | null = null;
+      try {
+        original = await inspectContainer(deployment.resourceName);
+      } catch (error) {
+        if (!/No such object|No such container|not found/i.test(commandDetail(error))) throw error;
+      }
+      const suffix = randomBytes(8).toString('hex');
+      const replacementName = `${plan.containerName}-replacement-${suffix}`;
+      const backupName = `${deployment.resourceName}-previous-${suffix}`;
+      let replacementCreated = false;
+      let originalRenamed = false;
+      let replacementRenamed = false;
+      try {
+        const { stdout } = await runDockerCommand(replacementCreateArgs(plan, replacementName, original), { timeout: 240_000 });
+        replacementCreated = true;
+        if (original) {
+          if (original.State?.Running) await runDockerCommand(['stop', deployment.resourceName]);
+          await runDockerCommand(['rename', deployment.resourceName, backupName]);
+          originalRenamed = true;
+        }
+        await runDockerCommand(['rename', replacementName, plan.containerName]);
+        replacementRenamed = true;
+        await runDockerCommand(['start', plan.containerName]);
+        this.repo.updateRuntime({
+          appId,
+          resourceId: stdout.trim(),
+          resourceName: plan.containerName,
+          deployInput: plan.resolvedDeployInput
+        });
+      } catch (error) {
+        const rollbackErrors: string[] = [];
+        const attempt = async (args: string[]) => {
+          try { await runDockerCommand(args); }
+          catch (rollbackError) { rollbackErrors.push(commandDetail(rollbackError)); }
+        };
+        // Never remove volumes, including when discarding a failed replacement.
+        if (replacementCreated) await attempt(['rm', '-f', replacementRenamed ? plan.containerName : replacementName]);
+        if (originalRenamed) await attempt(['rename', backupName, deployment.resourceName]);
+        if (original?.State?.Running) await attempt(['start', deployment.resourceName]);
+        throw new DeployExecutionError(`${commandDetail(error)}. ${rollbackErrors.length
+          ? `Rollback incomplete; previous container ${backupName}: ${rollbackErrors.join('; ')}`
+          : 'Previous container and volumes preserved.'}`);
+      }
+      const warnings: string[] = [];
+      if (originalRenamed) {
+        try { await runDockerCommand(['rm', '-f', backupName]); }
+        catch (error) { warnings.push(`Replacement is running; previous container ${backupName} could not be removed: ${commandDetail(error)}`); }
+      }
+      const status = await this.managedDeploymentStatus(appId);
+      return status ? { ...status, warnings } : null;
     }
 
     if (deployment.provider === 'docker_compose') {
@@ -4210,9 +4296,11 @@ export class DeployService {
 
     const plan = await this.buildPlan(deployment.deployInput, false);
     let currentState = 'unknown';
+    let attachedVolumes: NonNullable<DockerInspectContainer['Mounts']> = [];
 
     try {
       const container = await inspectContainer(deployment.resourceName);
+      attachedVolumes = (container.Mounts ?? []).filter((mount) => mount.Type === 'volume');
       currentState = container.State?.Status ?? (container.State?.Running ? 'running' : 'stopped');
     } catch (error) {
       const detail = commandDetail(error);
@@ -4241,13 +4329,14 @@ export class DeployService {
         `Recreate Docker container ${plan.containerName}.`
       ],
       preserved: [
-        'Bind-mounted host paths and named Docker volumes are preserved.',
+        'Bind-mounted host paths and named and anonymous Docker volumes are preserved.',
+        ...attachedVolumes.map((mount) => `Reattach Docker volume ${mount.Name} at ${mount.Destination} (${mount.RW === false ? 'read-only' : 'read-write'}).`),
         'The existing app record and route are preserved.',
         `The same published port ${plan.hostPort ?? plan.containerPort} is reused.`
       ],
       removed: [
-        `The old managed container ${deployment.resourceName} is removed before recreation.`,
-        'Images and bind-mounted data are not deleted.'
+        `The old managed container ${deployment.resourceName} is removed only after the replacement starts; creation/start failures roll back to the previous container.`,
+        'Images, bind-mounted data, and Docker volumes are not deleted.'
       ],
       warnings: [
         ...warnings,
