@@ -163,6 +163,12 @@ Deployment drift checks can detect:
 
 Backup exports include apps, settings, managed deployment records, redeploy metadata, managed deployment files, discovered Docker Compose project files, and readable Docker bind mount or named volume data. By default, the backup scans all local Docker containers so Dockge-managed stacks and manually started containers can be included in the same bundle. Set `BACKUP_DOCKER_SCOPE=managed` to only include deployments created by The Containers. See [docs/migration-checklist.md](docs/migration-checklist.md) before moving The Containers to a new host.
 
+Restore first previews the exact host files and named-volume destinations for confirmation. It validates every file before changing records, rejects symbolic links and conflicting destinations, and limits project files to the configured deployments directory, locally discovered Compose directories, or declared bind mounts. On a new host, map project files into an approved directory before restoring. The confirmation expires after ten minutes; API clients must call `POST /api/backup/restore/preview` with the backup, then send the same backup to `POST /api/backup/restore` with the returned `confirmation` in the `X-Backup-Confirmation` header.
+
+New backups include file permission bits and numeric UID/GID. Restore attempts ownership without elevation and reports warnings when it is not permitted. Legacy backups without this metadata use mode `0600` and retain existing ownership (new files belong to the service user). Named-volume restores use `docker cp -a`; a failed volume restore never writes to its recorded host source as a fallback. File permissions cover `0777` bits; special bits and directory metadata are not archived.
+
+Preview and restore accept the configured Docker data cap plus two 5 MiB file budgets, base64 expansion, and 16 MiB of JSON metadata. Other routes keep their normal body limit. Compose project file exports now share a 5 MiB total budget.
+
 ## Important Safety Model
 
 The Containers automates common deployment work, but it does not bypass operating system permissions.

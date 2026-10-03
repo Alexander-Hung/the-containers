@@ -1,10 +1,12 @@
 import type { FastifyInstance } from 'fastify';
+import { createHash, randomBytes } from 'node:crypto';
+import { constants } from 'node:fs';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { ZodError } from 'zod';
+import { z, ZodError } from 'zod';
 import { config } from '../../config.js';
 import { AppConflictError, type AppsService } from '../apps/apps.service.js';
 import type { AuditService } from '../audit/audit.service.js';
@@ -15,6 +17,9 @@ type BackupFile = {
   encoding: 'base64';
   content: string;
   size: number;
+  mode?: number;
+  uid?: number;
+  gid?: number;
 };
 
 type DockerMountArchive = {
@@ -63,6 +68,9 @@ const maxBackupFileSize = 1024 * 1024;
 const maxBackupFilesTotalSize = 5 * 1024 * 1024;
 const maxDockerDataFileSize = Number(process.env.BACKUP_DOCKER_DATA_MAX_FILE_BYTES ?? 25 * 1024 * 1024);
 const maxDockerDataTotalSize = Number(process.env.BACKUP_DOCKER_DATA_MAX_TOTAL_BYTES ?? 256 * 1024 * 1024);
+// Base64 expansion for deployment files, project files and Docker data, plus
+// 16 MiB for JSON keys, paths, app/settings records and archive metadata.
+const restoreBodyLimit = Math.ceil((2 * maxBackupFilesTotalSize + maxDockerDataTotalSize) / 3) * 4 + 16 * 1024 * 1024;
 const execFileAsync = promisify(execFile);
 
 function safeRelativePath(value: string) {
@@ -72,13 +80,6 @@ function safeRelativePath(value: string) {
     !value.includes('\0') &&
     !value.split(/[\\/]+/).includes('..')
   );
-}
-
-function safeDeploymentTarget(relativePath: string) {
-  const root = path.resolve(config.deploymentsPath);
-  const target = path.resolve(root, relativePath);
-
-  return target.startsWith(`${root}${path.sep}`) ? target : null;
 }
 
 async function collectDeploymentFiles() {
@@ -119,7 +120,10 @@ async function collectDeploymentFiles() {
         path: relativePath,
         encoding: 'base64',
         content: content.toString('base64'),
-        size: stat.size
+        size: stat.size,
+        mode: stat.mode & 0o777,
+        uid: stat.uid,
+        gid: stat.gid
       });
     }
   }
@@ -310,7 +314,10 @@ async function collectFilesFromPath(
         path: relativePath,
         encoding: 'base64',
         content: content.toString('base64'),
-        size: stat.size
+        size: stat.size,
+        mode: stat.mode & 0o777,
+        uid: stat.uid,
+        gid: stat.gid
       });
     }
   }
@@ -383,6 +390,7 @@ async function collectDockerProjectFiles(
 ) {
   const files: DockerProjectFile[] = [];
   const seen = new Set<string>();
+  let totalSize = 0;
 
   for (const { container } of containers) {
     for (const filePath of containerComposeConfigFiles(container)) {
@@ -397,12 +405,13 @@ async function collectDockerProjectFiles(
       try {
         const stat = await fs.stat(resolved);
 
-        if (!stat.isFile() || stat.size > maxBackupFileSize) {
+        if (!stat.isFile() || stat.size > maxBackupFileSize || totalSize + stat.size > maxBackupFilesTotalSize) {
           continue;
         }
 
         const content = await fs.readFile(resolved);
 
+        totalSize += stat.size;
         files.push({
           path: path.basename(resolved),
           absolutePath: resolved,
@@ -410,7 +419,10 @@ async function collectDockerProjectFiles(
           container: containerName(container),
           encoding: 'base64',
           content: content.toString('base64'),
-          size: stat.size
+          size: stat.size,
+          mode: stat.mode & 0o777,
+          uid: stat.uid,
+          gid: stat.gid
         });
       } catch {
         continue;
@@ -477,76 +489,159 @@ async function collectDockerDataArchives(
   return archives;
 }
 
-async function restoreDockerProjectFiles(files: unknown) {
-  if (!Array.isArray(files)) {
-    return 0;
-  }
+class InvalidBackupError extends Error {}
 
-  let restored = 0;
-
-  for (const file of files) {
-    if (!file || typeof file !== 'object') {
-      continue;
-    }
-
-    const input = file as Partial<DockerProjectFile>;
-
-    if (
-      typeof input.absolutePath !== 'string' ||
-      !path.isAbsolute(input.absolutePath) ||
-      input.encoding !== 'base64' ||
-      typeof input.content !== 'string'
-    ) {
-      continue;
-    }
-
-    await fs.mkdir(path.dirname(input.absolutePath), { recursive: true });
-    await fs.writeFile(input.absolutePath, Buffer.from(input.content, 'base64'), { mode: 0o600 });
-    restored += 1;
-  }
-
-  return restored;
+function hasControlCharacters(value: string) {
+  return [...value].some((character) => character.charCodeAt(0) < 32);
 }
 
-async function writeBackupFilesToRoot(root: string, files: BackupFile[]) {
-  let restored = 0;
-  const resolvedRoot = path.resolve(root);
+const backupFileSchema = z.object({
+  path: z.string().min(1).refine((value) => Boolean(safeRelativePath(value)) && value !== '.' && !hasControlCharacters(value)),
+  encoding: z.literal('base64'),
+  content: z.string().refine((value) => Buffer.from(value, 'base64').toString('base64') === value, 'Invalid base64 content'),
+  size: z.number().int().nonnegative(),
+  mode: z.number().int().min(0).max(0o777).optional(),
+  uid: z.number().int().min(0).max(0xfffffffe).optional(),
+  gid: z.number().int().min(0).max(0xfffffffe).optional()
+}).refine((file) => Buffer.byteLength(file.content, 'base64') === file.size, 'File size does not match content');
+const absolutePathSchema = z.string().refine((value) => path.isAbsolute(value) && !hasControlCharacters(value));
+const restoreManifestSchema = z.object({
+  apps: z.array(z.unknown()),
+  deployments: z.array(z.unknown()).optional(),
+  settings: z.unknown().optional(),
+  deploymentFiles: z.array(backupFileSchema).default([]),
+  dockerProjectFiles: z.array(z.object({
+    absolutePath: absolutePathSchema,
+    // File validation is shared with deployment and mount entries.
+  }).passthrough().and(backupFileSchema)).default([]),
+  dockerDataArchives: z.array(z.object({
+    type: z.enum(['bind', 'volume']),
+    source: absolutePathSchema,
+    name: z.string().nullable().optional(),
+    files: z.array(backupFileSchema)
+  }).refine((archive) => archive.type !== 'volume' || Boolean(archive.name?.match(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/)), 'Invalid volume name')).default([])
+});
+type RestoreManifest = z.infer<typeof restoreManifestSchema>;
 
-  for (const file of files) {
-    if (!safeRelativePath(file.path)) {
-      continue;
-    }
-
-    const target = path.resolve(resolvedRoot, file.path);
-
-    if (!target.startsWith(`${resolvedRoot}${path.sep}`)) {
-      continue;
-    }
-
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, Buffer.from(file.content, 'base64'), { mode: 0o600 });
-    restored += 1;
-  }
-
-  return restored;
+function withinRoot(root: string, target: string) {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  return relative !== '' && !path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`);
 }
 
-async function restoreNamedVolume(name: string, files: BackupFile[]) {
-  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'the-containers-volume-restore-'));
-  const helperName = `the-containers-restore-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+async function validateHostTarget(target: string) {
+  // Check every existing component, including the final file and the approved root.
+  // Missing components are allowed, but links never establish an approved destination.
+  let current = path.parse(target).root;
+  const parts = target.slice(current.length).split(path.sep).filter(Boolean);
+  for (const [index, part] of parts.entries()) {
+    current = path.join(current, part);
+    const stat = await fs.lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (!stat) continue;
+    if (stat.isSymbolicLink() || (index < parts.length - 1 && !stat.isDirectory()) ||
+        (index === parts.length - 1 && (!stat.isFile() || stat.nlink > 1))) {
+      throw new InvalidBackupError(`Unsafe restore destination: ${current}`);
+    }
+  }
+}
 
+async function validateRestoreManifest(body: unknown, appsService: AppsService) {
+  const manifest = restoreManifestSchema.parse(body);
+  const roots = [path.resolve(config.deploymentsPath)];
+  if (manifest.dockerProjectFiles.length) {
+    const containers = await discoverBackupContainers(appsService.exportDeployments(), appsService.exportApps().apps);
+    roots.push(...containers.flatMap(({ container }) => containerComposeConfigFiles(container).map((file) => path.dirname(file))));
+  }
+  // Declared bind roots are visible in the preview and require a separate confirmation.
+  roots.push(...manifest.dockerDataArchives.filter((archive) => archive.type === 'bind').map((archive) => path.resolve(archive.source)));
+  if (roots.some((root) => root === path.parse(root).root)) {
+    throw new InvalidBackupError('A filesystem root cannot be a restore destination');
+  }
+  const destinations: string[] = [];
+  const hostTargets = new Map<string, string>();
+  async function addTarget(target: string, file: BackupFile) {
+    const contents = JSON.stringify([file.content, file.mode, file.uid, file.gid]);
+    // Managed compose files can legitimately appear in both export sections.
+    if (hostTargets.get(target) === contents) return;
+    if (hostTargets.has(target) || [...hostTargets.keys()].some((other) => withinRoot(other, target) || withinRoot(target, other))) {
+      throw new InvalidBackupError(`Conflicting restore destination: ${target}`);
+    }
+    await validateHostTarget(target);
+    hostTargets.set(target, contents);
+    destinations.push(target);
+  }
+  for (const file of manifest.deploymentFiles) {
+    const target = path.resolve(config.deploymentsPath, file.path);
+    if (!withinRoot(config.deploymentsPath, target)) throw new InvalidBackupError(`Invalid deployment path: ${file.path}`);
+    await addTarget(target, file);
+  }
+  for (const file of manifest.dockerProjectFiles) {
+    const target = path.resolve(file.absolutePath);
+    if (!roots.some((root) => withinRoot(root, target))) throw new InvalidBackupError(`Unapproved project destination: ${target}`);
+    await addTarget(target, file);
+  }
+  const volumeTargets = new Set<string>();
+  for (const archive of manifest.dockerDataArchives) {
+    for (const file of archive.files) {
+      const target = path.resolve(archive.source, file.path);
+      if (!withinRoot(archive.source, target)) throw new InvalidBackupError(`Invalid mount path: ${file.path}`);
+      if (archive.type === 'bind') await addTarget(target, file);
+      else {
+        const destination = `volume:${archive.name}/${path.posix.normalize(file.path)}`;
+        if ([...volumeTargets].some((other) => other === destination || other.startsWith(`${destination}/`) || destination.startsWith(`${other}/`))) {
+          throw new InvalidBackupError(`Conflicting volume destination: ${destination}`);
+        }
+        volumeTargets.add(destination);
+        destinations.push(destination);
+      }
+    }
+  }
+  return { manifest, destinations };
+}
+
+async function writeBackupFile(target: string, file: BackupFile, warnings: string[]) {
+  await validateHostTarget(target);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await validateHostTarget(target);
+  const handle = await fs.open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
   try {
-    await writeBackupFilesToRoot(tmpRoot, files);
-    await runDocker(['volume', 'create', name]);
+    if ((await handle.stat()).nlink > 1) throw new InvalidBackupError(`Hard-linked restore destination: ${target}`);
+    await handle.truncate(0);
+    await handle.writeFile(Buffer.from(file.content, 'base64'));
+    if (file.uid !== undefined && file.gid !== undefined) {
+      try {
+        await handle.chown(file.uid, file.gid);
+      } catch (error) {
+        warnings.push(`Could not restore ownership ${file.uid}:${file.gid} for ${target}: ${(error as NodeJS.ErrnoException).code ?? 'unknown error'}`);
+      }
+    }
+    // Apply permissions after ownership (chown can clear special mode bits).
+    await handle.chmod(file.mode ?? 0o600);
+  } finally {
+    await handle.close();
+  }
+}
 
+async function writeBackupFilesToRoot(root: string, files: BackupFile[], warnings: string[]) {
+  for (const file of files) await writeBackupFile(path.resolve(root, file.path), file, warnings);
+  return files.length;
+}
+
+async function restoreNamedVolume(name: string, files: BackupFile[], warnings: string[]) {
+  const tmpRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'the-containers-volume-restore-')));
+  const helperName = `the-containers-restore-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  try {
+    await writeBackupFilesToRoot(tmpRoot, files, warnings);
+    await runDocker(['volume', 'create', name]);
     try {
       await runDocker(['create', '--name', helperName, '-v', `${name}:/restore`, 'busybox:latest', 'sh']);
     } catch {
       await runDocker(['pull', 'busybox:latest']);
       await runDocker(['create', '--name', helperName, '-v', `${name}:/restore`, 'busybox:latest', 'sh']);
     }
-
-    await runDocker(['cp', `${tmpRoot}${path.sep}.`, `${helperName}:/restore`]);
+    await runDocker(['cp', '-a', `${tmpRoot}${path.sep}.`, `${helperName}:/restore`]);
     return files.length;
   } finally {
     await runDocker(['rm', '-f', helperName]).catch(() => undefined);
@@ -554,153 +649,15 @@ async function restoreNamedVolume(name: string, files: BackupFile[]) {
   }
 }
 
-function backupFilesFromUnknown(files: unknown) {
-  if (!Array.isArray(files)) {
-    return [];
-  }
-
-  return files.flatMap((file) => {
-    if (!file || typeof file !== 'object') {
-      return [];
-    }
-
-    const input = file as Partial<BackupFile>;
-
-    if (
-      typeof input.path !== 'string' ||
-      input.encoding !== 'base64' ||
-      typeof input.content !== 'string' ||
-      typeof input.size !== 'number' ||
-      !safeRelativePath(input.path)
-    ) {
-      return [];
-    }
-
-    return [{
-      path: input.path,
-      encoding: input.encoding,
-      content: input.content,
-      size: input.size
-    }];
-  });
-}
-
-async function restoreMountArchive(input: Partial<DockerMountArchive>) {
-  const files = backupFilesFromUnknown(input.files);
-
-  if (files.length === 0) {
-    return 0;
-  }
-
-  if (input.type === 'volume' && typeof input.name === 'string' && input.name) {
-    try {
-      return await restoreNamedVolume(input.name, files);
-    } catch {
-      if (typeof input.source !== 'string' || !path.isAbsolute(input.source)) {
-        return 0;
-      }
-    }
-  }
-
-  if (typeof input.source !== 'string' || !path.isAbsolute(input.source)) {
-    return 0;
-  }
-
-  return restoreFilesToRoot(input.source, files);
-}
-
-async function restoreDeploymentFiles(files: unknown) {
-  if (!Array.isArray(files)) {
-    return 0;
-  }
-
+async function restoreDockerDataArchives(archives: RestoreManifest['dockerDataArchives'], warnings: string[]) {
   let restored = 0;
-
-  for (const file of files) {
-    if (!file || typeof file !== 'object') {
-      continue;
-    }
-
-    const input = file as Partial<BackupFile>;
-
-    if (
-      typeof input.path !== 'string' ||
-      input.encoding !== 'base64' ||
-      typeof input.content !== 'string' ||
-      !safeRelativePath(input.path)
-    ) {
-      continue;
-    }
-
-    const target = safeDeploymentTarget(input.path);
-
-    if (!target) {
-      continue;
-    }
-
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, Buffer.from(input.content, 'base64'), { mode: 0o600 });
-    restored += 1;
-  }
-
-  return restored;
-}
-
-async function restoreFilesToRoot(root: string, files: unknown) {
-  if (!Array.isArray(files)) {
-    return 0;
-  }
-
-  let restored = 0;
-  const resolvedRoot = path.resolve(root);
-
-  for (const file of files) {
-    if (!file || typeof file !== 'object') {
-      continue;
-    }
-
-    const input = file as Partial<BackupFile>;
-
-    if (
-      typeof input.path !== 'string' ||
-      input.encoding !== 'base64' ||
-      typeof input.content !== 'string' ||
-      !safeRelativePath(input.path)
-    ) {
-      continue;
-    }
-
-    const target = path.resolve(resolvedRoot, input.path);
-
-    if (!target.startsWith(`${resolvedRoot}${path.sep}`)) {
-      continue;
-    }
-
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, Buffer.from(input.content, 'base64'), { mode: 0o600 });
-    restored += 1;
-  }
-
-  return restored;
-}
-
-async function restoreDockerDataArchives(archives: unknown) {
-  if (!Array.isArray(archives)) {
-    return 0;
-  }
-
-  let restored = 0;
-
   for (const archive of archives) {
-    if (!archive || typeof archive !== 'object') {
-      continue;
-    }
-
-    const input = archive as Partial<DockerMountArchive>;
-
-    restored += await restoreMountArchive(input);
+    if (!archive.files.length) continue;
+    // Never fall back from a named volume to an arbitrary host source path.
+    restored += archive.type === 'volume'
+      ? await restoreNamedVolume(archive.name!, archive.files, warnings)
+      : await writeBackupFilesToRoot(archive.source, archive.files, warnings);
   }
-
   return restored;
 }
 
@@ -762,7 +719,7 @@ export async function registerBackupRoutes(
 
     return {
       exportedAt: new Date().toISOString(),
-      version: 5,
+      version: 6,
       kind: 'the-containers-backup',
       apps,
       deployments,
@@ -778,21 +735,40 @@ export async function registerBackupRoutes(
     };
   });
 
-  app.post('/api/backup/restore', async (request, reply) => {
-    const body = extractBackupBody(request.body) as {
-      apps?: unknown[];
-      deployments?: unknown[];
-      deploymentFiles?: unknown[];
-      dockerProjectFiles?: unknown[];
-      dockerDataArchives?: unknown[];
-      settings?: unknown;
-    };
+  const confirmations = new Map<string, { digest: string; expires: number }>();
+  const digest = (body: unknown) => createHash('sha256').update(JSON.stringify(body)).digest('hex');
 
-    if (!body?.apps || !Array.isArray(body.apps)) {
-      return reply.code(400).send({ message: 'Backup file does not contain apps.' });
-    }
-
+  app.post('/api/backup/restore/preview', { bodyLimit: restoreBodyLimit }, async (request, reply) => {
     try {
+      const body = extractBackupBody(request.body);
+      const { destinations } = await validateRestoreManifest(body, appsService);
+      for (const [token, entry] of confirmations) {
+        if (entry.expires < Date.now()) confirmations.delete(token);
+      }
+      if (confirmations.size >= 20) confirmations.delete(confirmations.keys().next().value!);
+      const confirmation = randomBytes(32).toString('hex');
+      confirmations.set(confirmation, { digest: digest(body), expires: Date.now() + 10 * 60_000 });
+      return { destinations, confirmation };
+    } catch (error) {
+      if (error instanceof ZodError || error instanceof InvalidBackupError) {
+        return reply.code(400).send({ message: error.message });
+      }
+      throw error;
+    }
+  });
+
+  app.post('/api/backup/restore', { bodyLimit: restoreBodyLimit }, async (request, reply) => {
+    const rawBody = extractBackupBody(request.body);
+    try {
+      const { manifest: body, destinations } = await validateRestoreManifest(rawBody, appsService);
+      if (destinations.length) {
+        const token = request.headers['x-backup-confirmation'];
+        const confirmation = typeof token === 'string' ? confirmations.get(token) : undefined;
+        if (!confirmation || confirmation.expires < Date.now() || confirmation.digest !== digest(rawBody)) {
+          throw new InvalidBackupError('Preview and confirm this backup before restoring files');
+        }
+        confirmations.delete(token as string);
+      }
       const result = await appsService.restoreBackup({
         apps: body.apps,
         deployments: body.deployments,
@@ -800,9 +776,15 @@ export async function registerBackupRoutes(
         settingsService,
         adminTokenConfigured: Boolean(config.adminToken)
       });
-      const deploymentFiles = await restoreDeploymentFiles(body.deploymentFiles);
-      const dockerProjectFiles = await restoreDockerProjectFiles(body.dockerProjectFiles);
-      const dockerDataFiles = await restoreDockerDataArchives(body.dockerDataArchives);
+      const warnings: string[] = [];
+      const allFiles = [...body.deploymentFiles, ...body.dockerProjectFiles, ...body.dockerDataArchives.flatMap((archive) => archive.files)];
+      if (allFiles.some((file) => file.mode === undefined || file.uid === undefined || file.gid === undefined)) {
+        warnings.push('Some files have no permission or ownership metadata (legacy backup); missing modes default to 0600 and missing ownership is unchanged (new files belong to the service user).');
+      }
+      const deploymentFiles = await writeBackupFilesToRoot(config.deploymentsPath, body.deploymentFiles, warnings);
+      for (const file of body.dockerProjectFiles) await writeBackupFile(path.resolve(file.absolutePath), file, warnings);
+      const dockerProjectFiles = body.dockerProjectFiles.length;
+      const dockerDataFiles = await restoreDockerDataArchives(body.dockerDataArchives, warnings);
       auditService.record({
         action: 'backup.restore',
         targetType: 'backup',
@@ -814,9 +796,13 @@ export async function registerBackupRoutes(
         ...result,
         deploymentFiles,
         dockerProjectFiles,
-        dockerDataFiles
+        dockerDataFiles,
+        warnings
       };
     } catch (error) {
+      if (error instanceof InvalidBackupError) {
+        return reply.code(400).send({ message: error.message });
+      }
       if (error instanceof ZodError) {
         return reply.code(400).send({
           message: 'Invalid backup input',

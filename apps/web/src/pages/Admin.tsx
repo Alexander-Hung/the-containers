@@ -1637,16 +1637,20 @@ export function Admin({ onBack, openDeploySignal = 0 }: Props) {
       return;
     }
 
-    if (!window.confirm('Restoring a backup will replace apps, settings, and managed deployment records. Continue?')) {
-      return;
-    }
-
     try {
-      const result = await api.restoreBackup(JSON.parse(await file.text()));
+      const payload: unknown = JSON.parse(await file.text());
+      const preview = await api.previewBackupRestore(payload);
+      const destinations = preview.destinations.length
+        ? `\n\nFiles that will be overwritten or created:\n${preview.destinations.join('\n')}`
+        : '\n\nThis backup contains no files to restore.';
+      if (!window.confirm(`Restoring a backup will replace apps, settings, and managed deployment records.${destinations}\n\nOnly continue if you trust these destinations. Continue?`)) {
+        return;
+      }
+      const result = await api.restoreBackup(payload, preview.confirmation);
       setApps(result.apps);
       setSettings(result.settings);
       setMessage(
-        `${proxySyncMessage(result.proxySync)} Restored ${result.deployments} managed deployment records, ${result.deploymentFiles} deployment files, ${result.dockerProjectFiles} Docker project files, and ${result.dockerDataFiles} Docker data files. A pre-restore snapshot was saved.`
+        `${proxySyncMessage(result.proxySync)} Restored ${result.deployments} managed deployment records, ${result.deploymentFiles} deployment files, ${result.dockerProjectFiles} Docker project files, and ${result.dockerDataFiles} Docker data files. A pre-restore snapshot was saved.${result.warnings.length ? ` Warnings: ${result.warnings.join(' ')}` : ''}`
       );
       await load();
     } catch (err) {

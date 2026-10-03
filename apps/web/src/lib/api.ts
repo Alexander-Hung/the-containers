@@ -215,6 +215,9 @@ export type BackupDeploymentFile = {
   encoding: 'base64';
   content: string;
   size: number;
+  mode?: number;
+  uid?: number;
+  gid?: number;
 };
 
 export type BackupDockerDataArchive = {
@@ -509,17 +512,24 @@ export const api = {
       notes?: string[];
       settings: ContainerSettings;
     }>('/api/backup'),
-  restoreBackup: (payload: unknown) =>
+  previewBackupRestore: (payload: unknown) =>
+    request<{ destinations: string[]; confirmation: string }>('/api/backup/restore/preview', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    }),
+  restoreBackup: (payload: unknown, confirmation: string) =>
     request<AppListMutationResult & {
       settings: ContainerSettings;
       deployments: number;
       deploymentFiles: number;
       dockerProjectFiles: number;
       dockerDataFiles: number;
+      warnings: string[];
     }>(
       '/api/backup/restore',
       {
         method: 'POST',
+        headers: { 'x-backup-confirmation': confirmation },
         body: JSON.stringify(payload)
       }
     ),
