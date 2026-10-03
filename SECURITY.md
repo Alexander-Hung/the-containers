@@ -28,6 +28,27 @@ When reporting, include:
 
 The Containers can call Docker and Docker Compose on the host. This is powerful and must be treated as host-level access.
 
+Protected API routes require `ADMIN_TOKEN` when `HOST` is not loopback. An empty
+token on the default `HOST=0.0.0.0` returns `503` for admin requests; configured
+tokens return `401` for missing or incorrect credentials. Health checks and the
+read-only app list remain public unless dashboard authentication is required
+for the app list. Required dashboard authentication fails closed with `503`
+when no token is configured.
+
+Tokenless access is supported only for trusted local development bound to
+`127.x.x.x`, `::1`, or `localhost`. Do not expose a tokenless loopback API through
+Caddy or a tunnel; the guard uses the configured `HOST` and cannot determine
+whether a reverse proxy exposes it elsewhere.
+
+`deploy/setup-autostart.sh` generates a random admin token when the env file has
+none and prints it once. Existing tokens are preserved. The env directory and
+file belong to `root:<service group>`, with modes `0750` and `0640`
+respectively on every run. Reruns normalize existing permissions, including
+`0700` directories and `0600` files, so the service group can traverse the
+directory and read the file while other users have no access.
+The basic `install.sh` and manual install paths require an explicitly configured
+token for non-loopback admin access.
+
 The Containers will not silently:
 
 - Run `sudo`.

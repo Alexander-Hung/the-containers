@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { isIP } from 'node:net';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { config } from './config.js';
 
@@ -48,6 +49,11 @@ function tokenMatches(candidate: string | null) {
   );
 }
 
+function isLoopbackHost(host: string) {
+  return host === 'localhost' || host === '::1' ||
+    (isIP(host) === 4 && host.startsWith('127.'));
+}
+
 export function registerAdminAuth(
   app: FastifyInstance,
   options: { dashboardAuthRequired?: () => boolean } = {}
@@ -59,13 +65,20 @@ export function registerAdminAuth(
 
     const url = request.url.split('?')[0];
     const dashboardApiRequiresAuth =
-      options.dashboardAuthRequired?.() && url === '/api/apps';
+      (config.dashboardAuthRequired || options.dashboardAuthRequired?.()) &&
+      url === '/api/apps';
 
     if (!config.adminToken) {
       if (dashboardApiRequiresAuth) {
         return reply.code(503).send({
           message:
             'Dashboard auth is required, but ADMIN_TOKEN is not configured on the API.'
+        });
+      }
+
+      if (!isLoopbackHost(config.host) && !isPublicApi(request)) {
+        return reply.code(503).send({
+          message: 'ADMIN_TOKEN must be configured for admin API access on a non-loopback HOST.'
         });
       }
 

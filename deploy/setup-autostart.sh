@@ -164,13 +164,42 @@ replace_or_append_env() {
   fi
 }
 
+ensure_admin_token() {
+  # Do not source an operator's env file as root just to inspect its token.
+  run_root node - "$ENV_FILE" <<'NODE'
+const fs = require('node:fs');
+const { randomBytes } = require('node:crypto');
+const file = process.argv[2];
+const contents = fs.readFileSync(file, 'utf8');
+const assignments = [...contents.matchAll(/^ADMIN_TOKEN=(.*)$/gm)];
+const value = assignments.at(-1)?.[1].trim() ?? '';
+if (value && !/^(?:""|'')(?:\s+#.*)?$/.test(value) && !value.startsWith('#')) {
+  process.exit(0);
+}
+const token = randomBytes(32).toString('hex');
+const updated = assignments.length
+  ? contents.replace(/^ADMIN_TOKEN=.*$/gm, `ADMIN_TOKEN=${token}`)
+  : `${contents}${contents.endsWith('\n') ? '' : '\n'}ADMIN_TOKEN=${token}\n`;
+fs.writeFileSync(file, updated);
+console.log(`Generated ADMIN_TOKEN (save it now): ${token}`);
+NODE
+}
+
 write_env() {
+  local primary_group
+  primary_group="$(user_primary_group)"
+
   log "Writing environment file at $ENV_FILE..."
-  run_root mkdir -p "$ENV_DIR"
+  run_root mkdir -p -m 0750 "$ENV_DIR"
+  run_root chown root:"$primary_group" "$ENV_DIR"
+  run_root chmod 0750 "$ENV_DIR"
   run_root mkdir -p "$DATA_DIR"
   run_root chown -R "$SERVICE_USER":"$SERVICE_USER" "$DATA_DIR"
 
   if ! run_root test -f "$ENV_FILE"; then
+    run_root touch "$ENV_FILE"
+    run_root chown root:"$primary_group" "$ENV_FILE"
+    run_root chmod 0640 "$ENV_FILE"
     run_root tee "$ENV_FILE" >/dev/null <<EOF_ENV
 HOST=0.0.0.0
 PORT=3001
@@ -189,6 +218,11 @@ THE_CONTAINERS_DASHBOARD_TARGET_URL=http://127.0.0.1:3001
 EOF_ENV
   fi
 
+  # Remove public access before writing secrets, and always let the service
+  # group read the file after changing its ownership to root.
+  run_root chown root:"$primary_group" "$ENV_FILE"
+  run_root chmod 0640 "$ENV_FILE"
+
   replace_or_append_env "DOCKER_BIN" "docker"
   replace_or_append_env "DATABASE_PATH" "$DATA_DIR/the-containers.sqlite"
   replace_or_append_env "WEB_DIST_PATH" "$ROOT_DIR/apps/web/dist"
@@ -199,7 +233,8 @@ EOF_ENV
     replace_or_append_env "DOCKER_HOST" "$DOCKER_HOST_VALUE"
   fi
 
-  run_root chmod 0644 "$ENV_FILE"
+  ensure_admin_token
+  run_root chown root:"$primary_group" "$ENV_FILE"
 }
 
 install_node_app() {
