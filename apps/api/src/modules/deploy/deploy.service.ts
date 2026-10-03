@@ -43,6 +43,7 @@ const deployInputSchema = z.object({
 type ParsedDeployInput = z.infer<typeof deployInputSchema>;
 
 type PublishedPort = {
+  hostIp: string | null;
   hostPort: number | null;
   containerPort: number;
   protocol: string;
@@ -820,11 +821,20 @@ function trimDockerPrefix(tokens: string[]) {
 }
 
 function parsePortSpec(raw: string): PublishedPort | null {
-  const [withoutProtocol, protocol = 'tcp'] = raw.split('/');
-  const segments = withoutProtocol.split(':');
+  const [withoutProtocol, protocol = 'tcp', extra] = raw.split('/');
+  const ipv6 = withoutProtocol.match(/^\[([^\]]+)\]:(.*)$/);
+  const segments = (ipv6 ? ipv6[2] : withoutProtocol).split(':');
+  const hostIp = ipv6 ? ipv6[1] : segments.length === 3 ? segments.shift()! : null;
   const containerPart = segments.at(-1);
 
-  if (!containerPart) {
+  if (
+    extra !== undefined ||
+    !['tcp', 'udp', 'sctp'].includes(protocol) ||
+    segments.length > 2 ||
+    (ipv6 && segments.length !== 2) ||
+    (hostIp !== null && net.isIP(hostIp) === 0) ||
+    !containerPart || !/^\d+$/.test(containerPart)
+  ) {
     return null;
   }
 
@@ -835,22 +845,32 @@ function parsePortSpec(raw: string): PublishedPort | null {
   }
 
   const hostPart = segments.length >= 2 ? segments.at(-2) : null;
-  const hostPort =
-    hostPart && /^\d+$/.test(hostPart)
-      ? Number(hostPart)
-      : segments.length === 1
-        ? null
-        : null;
+  if (hostPart && !/^\d+$/.test(hostPart)) {
+    return null;
+  }
+  const hostPort = hostPart ? Number(hostPart) : null;
 
   if (hostPort !== null && (hostPort < 1 || hostPort > 65535)) {
     return null;
   }
 
   return {
+    hostIp,
     hostPort,
     containerPort,
     protocol
   };
+}
+
+function formatPublishedPort(port: PublishedPort) {
+  const hostIp = port.hostIp?.includes(':') ? `[${port.hostIp}]` : port.hostIp;
+  const host = hostIp ? `${hostIp}:${port.hostPort ?? ''}:` : port.hostPort !== null ? `${port.hostPort}:` : '';
+  return `${host}${port.containerPort}/${port.protocol}`;
+}
+
+function publishedPortTargetUrl(hostIp: string | null | undefined, port: number) {
+  const host = !hostIp || hostIp === '0.0.0.0' ? '127.0.0.1' : hostIp === '::' ? '::1' : hostIp;
+  return `http://${host.includes(':') ? `[${host}]` : host}:${port}`;
 }
 
 function looksLikeHostPath(value: string) {
@@ -2102,11 +2122,12 @@ function composePortFromObject(value: JsonRecord): PublishedPort | null {
   const hostPort = parsePortNumber(value.published);
   const protocol = typeof value.protocol === 'string' ? value.protocol : 'tcp';
 
-  if (!containerPort || protocol !== 'tcp') {
+  if (!containerPort) {
     return null;
   }
 
   return {
+    hostIp: typeof value.host_ip === 'string' ? value.host_ip : null,
     hostPort,
     containerPort,
     protocol
@@ -2123,6 +2144,7 @@ function composePortFromValue(value: unknown): PublishedPort | null {
 
     return containerPort
       ? {
+          hostIp: null,
           hostPort: null,
           containerPort,
           protocol: 'tcp'
@@ -2133,6 +2155,12 @@ function composePortFromValue(value: unknown): PublishedPort | null {
   return isRecord(value) ? composePortFromObject(value) : null;
 }
 
+function firstComposePortIndex(ports: unknown[]) {
+  const parsed = ports.map(composePortFromValue);
+  const tcpIndex = parsed.findIndex((port) => port?.protocol === 'tcp');
+  return tcpIndex >= 0 ? tcpIndex : parsed.findIndex((port) => port !== null);
+}
+
 function firstComposePortForService(service: JsonRecord): PublishedPort | null {
   const ports = service.ports;
 
@@ -2140,15 +2168,7 @@ function firstComposePortForService(service: JsonRecord): PublishedPort | null {
     return null;
   }
 
-  for (const port of ports) {
-    const parsed = composePortFromValue(port);
-
-    if (parsed) {
-      return parsed;
-    }
-  }
-
-  return null;
+  return composePortFromValue(ports[firstComposePortIndex(ports)]);
 }
 
 function firstComposeExposePortForService(service: JsonRecord) {
@@ -2433,18 +2453,20 @@ function injectComposePort(compose: string, hostPort: number, containerPort: num
     return compose;
   }
 
-  const portMapping = `${hostPort}:${containerPort}`;
-
   if (Array.isArray(service.ports)) {
-    const index = service.ports.findIndex((port) => Boolean(composePortFromValue(port)));
+    const index = firstComposePortIndex(service.ports);
 
     if (index >= 0) {
-      service.ports[index] = portMapping;
+      const original = service.ports[index];
+      const port = composePortFromValue(original)!;
+      service.ports[index] = isRecord(original)
+        ? { ...original, published: String(hostPort), target: containerPort }
+        : formatPublishedPort({ ...port, hostPort, containerPort });
     } else {
-      service.ports.unshift(portMapping);
+      service.ports.unshift(`127.0.0.1:${hostPort}:${containerPort}/tcp`);
     }
   } else {
-    service.ports = [portMapping];
+    service.ports = [`127.0.0.1:${hostPort}:${containerPort}/tcp`];
   }
 
   return stringifyYaml(parsed.config);
@@ -2528,7 +2550,7 @@ function checkPortAvailable(port: number) {
   });
 }
 
-async function allocatePort(preferredPort: number | null) {
+async function allocatePort(preferredPort: number | null, reservedPorts: number[] = []) {
   if (preferredPort) {
     if (await checkPortAvailable(preferredPort)) {
       return preferredPort;
@@ -2538,7 +2560,7 @@ async function allocatePort(preferredPort: number | null) {
   }
 
   for (let port = 18080; port <= 19000; port += 1) {
-    if (await checkPortAvailable(port)) {
+    if (!reservedPorts.includes(port) && await checkPortAvailable(port)) {
       return port;
     }
   }
@@ -2555,13 +2577,13 @@ function needsPrivilegedPortRemap(port: number) {
   );
 }
 
-async function resolveHostPort(requestedHostPort: number | null, warnings: string[]) {
+async function resolveHostPort(requestedHostPort: number | null, warnings: string[], reservedPorts: number[] = []) {
   if (!requestedHostPort) {
-    return allocatePort(null);
+    return allocatePort(null, reservedPorts);
   }
 
   if (needsPrivilegedPortRemap(requestedHostPort)) {
-    const allocated = await allocatePort(null);
+    const allocated = await allocatePort(null, reservedPorts);
     warnings.push(
       `Host port ${requestedHostPort} needs elevated system privileges, so The Containers assigned ${allocated} instead.`
     );
@@ -2572,7 +2594,7 @@ async function resolveHostPort(requestedHostPort: number | null, warnings: strin
     return requestedHostPort;
   }
 
-  const allocated = await allocatePort(null);
+  const allocated = await allocatePort(null, reservedPorts);
   warnings.push(
     `Host port ${requestedHostPort} is already in use, so The Containers assigned ${allocated} instead.`
   );
@@ -4651,8 +4673,9 @@ export class DeployService {
     }
 
     const dockerRun = parseDockerRun(trimDockerPrefix(tokenizeShellCommand(parsed.command)));
+    const candidatePorts = dockerRun.ports.filter((port) => !parsed.containerPort || port.containerPort === parsed.containerPort);
     const selectedPublishedPort =
-      dockerRun.ports.find((port) => port.protocol === 'tcp') ?? dockerRun.ports[0];
+      candidatePorts.find((port) => port.protocol === 'tcp') ?? candidatePorts[0];
     const inferredContainerPort = inferKnownContainerPort(
       dockerRun.image,
       parsed.name ?? dockerRun.containerName
@@ -4675,11 +4698,14 @@ export class DeployService {
         ? []
         : [`No Docker publish mapping was found, so The Containers inferred container port ${containerPort}.`])
     ];
+    const reservedPorts = dockerRun.ports
+      .filter((port) => port !== selectedPublishedPort && port.protocol === (selectedPublishedPort?.protocol ?? 'tcp'))
+      .flatMap((port) => port.hostPort === null ? [] : [port.hostPort]);
     const hostPort =
       dockerRun.hostNetwork
         ? requestedHostPort
         : allocateHostPort
-        ? await resolveHostPort(requestedHostPort, warnings)
+        ? await resolveHostPort(requestedHostPort, warnings, reservedPorts)
         : requestedHostPort;
     const baseName =
       parsed.name ??
@@ -4691,7 +4717,10 @@ export class DeployService {
       routeMode === 'subpath'
         ? parsed.publicPath ?? `/${slugify(containerName) || 'app'}`
         : null;
-    const targetUrl = `http://127.0.0.1:${hostPort ?? requestedHostPort ?? containerPort}`;
+    const targetUrl = publishedPortTargetUrl(
+      dockerRun.hostNetwork ? null : selectedPublishedPort?.hostIp,
+      hostPort ?? requestedHostPort ?? containerPort
+    );
     const appPayload = {
       name: baseName,
       iconType: 'builtin' as const,
@@ -4706,6 +4735,15 @@ export class DeployService {
       tags: parsed.tags,
       favorite: parsed.favorite
     };
+    const publishedPort: PublishedPort = {
+      hostIp: selectedPublishedPort ? selectedPublishedPort.hostIp : '127.0.0.1',
+      hostPort: hostPort ?? requestedHostPort ?? containerPort,
+      containerPort,
+      protocol: selectedPublishedPort?.protocol ?? 'tcp'
+    };
+    const publishedPorts = selectedPublishedPort
+      ? dockerRun.ports.map((port) => port === selectedPublishedPort ? publishedPort : port)
+      : [...dockerRun.ports, publishedPort];
     const dockerArgs = dockerRun.hostNetwork
       ? [
           'run',
@@ -4719,8 +4757,7 @@ export class DeployService {
           '-d',
           '--name',
           containerName,
-          '-p',
-          `${hostPort ?? requestedHostPort ?? containerPort}:${containerPort}`,
+          ...publishedPorts.flatMap((port) => ['-p', formatPublishedPort(port)]),
           ...dockerRun.cleanedArgs
         ];
 
@@ -4817,7 +4854,10 @@ export class DeployService {
       routeMode === 'subpath'
         ? parsed.publicPath ?? `/${slugify(containerName) || 'app'}`
         : null;
-    const targetUrl = `http://127.0.0.1:${hostPort ?? requestedHostPort ?? containerPort}`;
+    const targetUrl = publishedPortTargetUrl(
+      hostNetwork ? null : selectedPublishedPort?.hostIp,
+      hostPort ?? requestedHostPort ?? containerPort
+    );
     const composeFilePath = path.join(projectDir, 'compose.yml');
     const appPayload = {
       name: baseName,
