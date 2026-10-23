@@ -15,6 +15,18 @@ cd /opt/the-containers
 
 `start.sh` loads `/etc/the-containers/the-containers.env`, verifies build output, starts Caddy if systemd is available, and starts The Containers.
 
+For systemd autostart and Docker permissions, use `./deploy/setup-autostart.sh`.
+It generates a random `ADMIN_TOKEN` when the env file has no token, prints the
+new token once, and preserves an existing token on reruns. Save the generated
+token securely and enter it in the admin UI. The env directory is owned by
+`root:<service group>` with mode `0750`, and env files use the same ownership
+with mode `0640` on every run. Reruns normalize existing permissions, including
+`0700` directories and service-owned `0600` files, so the service user can source
+the root-owned file through its service group while other users have no access.
+
+The basic `install.sh` path and manual installation require you to set a token
+before using the admin API from a non-loopback host.
+
 ## Manual Install
 
 ## 1. Install runtime dependencies
@@ -45,6 +57,9 @@ npm run build
 sudo useradd --system --home /opt/the-containers --shell /usr/sbin/nologin the-containers
 sudo mkdir -p /etc/the-containers /opt/the-containers/data
 sudo cp .env.example /etc/the-containers/the-containers.env
+sudo chown root:the-containers /etc/the-containers /etc/the-containers/the-containers.env
+sudo chmod 0750 /etc/the-containers
+sudo chmod 0640 /etc/the-containers/the-containers.env
 sudo chown -R the-containers:the-containers /opt/the-containers/data
 ```
 
@@ -64,10 +79,21 @@ CADDY_LISTEN=:80
 THE_CONTAINERS_DASHBOARD_TARGET_URL=http://127.0.0.1:3001
 ```
 
-Set `ADMIN_TOKEN` to require a token before anyone can create, edit, delete,
-import, export, reorder, or sync services from the admin UI. Set
+Set `ADMIN_TOKEN` to a strong random value before starting the service. Admin
+operations include deployment, create, edit, delete, import, export, reorder,
+and proxy sync. With an empty token and a non-loopback `HOST` (including the
+default `0.0.0.0`), protected API routes return `503` until a token is configured.
+With a token configured, missing or incorrect credentials return `401`. Set
 `DASHBOARD_AUTH_REQUIRED=true` to protect the read-only dashboard list too.
-Leave tokens empty only for trusted local development. `CORS_ORIGIN` can be left
+Health remains public; the read-only dashboard list remains public unless
+dashboard auth is required. Required dashboard auth returns `503` if no token
+is configured, even on loopback.
+
+Leave tokens empty only for trusted local development with `HOST=127.0.0.1`
+(other `127.x.x.x` addresses, `::1`, and `localhost` are also supported).
+Do not proxy a tokenless loopback API through a LAN-facing Caddy listener or a
+tunnel: the guard checks the configured bind host, not proxy exposure.
+`CORS_ORIGIN` can be left
 empty for same-origin dashboard usage, set to `*` for permissive development, or
 set to a comma-separated list of allowed origins.
 

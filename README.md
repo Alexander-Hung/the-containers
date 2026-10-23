@@ -16,6 +16,7 @@ Available now:
 - DNS diagnostics for route and public domain checks.
 - Docker run deployments with command parsing, automatic port assignment, permission checks, and managed cleanup.
 - Docker Compose deployments with YAML parsing, web service selection, port inference, bind mount checks, host network handling, and managed cleanup.
+- Static site deployments for already-built folders, served through a managed nginx container with read-only mounts.
 - Binary/service deployments for local HTTP services, installed as user systemd services on Linux or launchd agents on macOS.
 - Host permission panel for Docker CLI, Docker daemon, Compose runtime, bind mounts, privileged containers, capabilities, devices, host networking, Docker socket mounts, public domain DNS, and Caddy sync.
 - Managed deployment records. Apps deployed by The Containers are marked as managed and are cleaned up when deleted.
@@ -27,7 +28,7 @@ Available now:
 Planned:
 
 - GitHub auto-detect deployments.
-- Static site deployments.
+- Static site build steps from source repositories.
 - Node.js app deployments.
 - Python app deployments.
 - Advanced custom command deployments.
@@ -117,11 +118,12 @@ The Containers can deploy from:
 
 - `docker run` commands
 - Docker Compose YAML
+- built static site folders
 - Binary/service commands for local HTTP services
 
 The deploy flow is:
 
-1. Paste a Docker command, Compose file, or Binary/service command.
+1. Paste a Docker command, Compose file, static folder path, or Binary/service command.
 2. The Containers auto-fills app name, route host, and ports when possible.
 3. Review Host permission checks.
 4. Preview the deployment plan.
@@ -133,6 +135,8 @@ Binary/service deployments require the local web port where the service listens.
 Linux Binary/service deployments require a working user systemd bus for the user running The Containers. If The Containers itself runs from a system service, enable linger for that user and make sure `user@UID.service` is running. The deploy doctor shows the exact `loginctl`, `systemctl`, `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` commands for the current user.
 
 When a managed app is deleted, The Containers attempts to remove the related Docker container, Compose project, or local service and free the route.
+
+App imports replace the app list by ID, preserving managed deployment records for retained IDs. An import that omits a managed app is rejected without changing the app list; include that app in the import or delete it through the managed app delete flow first. Omitted unmanaged apps are removed. App imports do not restore deployment metadata; use backup restore for that. Backup restore accepts only `docker`, `docker_compose`, and `binary_service` deployment providers and rejects missing or unknown providers.
 
 ## Managed Deployment Operations
 
@@ -146,7 +150,7 @@ Apps deployed by The Containers receive a `Self-Host` badge and a managed deploy
 - Checked for deployment drift.
 - Repaired when a safe repair action is available.
 
-Redeploy preview shows what will be pulled, recreated, preserved, and removed before the action runs. Docker run redeploy requires saved metadata, so older deployments may need to be deleted and deployed again once before safe redeploy is available.
+Redeploy preview shows what will be pulled, recreated, preserved, and removed before the action runs, including attached Docker volumes and their destinations. Docker run redeploy reattaches anonymous volumes, creates a replacement before stopping the previous container, and retains the previous container until replacement startup and the deployment-record update succeed. Failures restore the previous container name and running state; container cleanup never deletes volumes during redeploy. Docker startup success does not establish application health. Docker run redeploy requires saved metadata, so older deployments may need to be deleted and deployed again once before safe redeploy is available.
 
 Deployment drift checks can detect:
 
@@ -158,6 +162,14 @@ Deployment drift checks can detect:
 - Docker run deployments that are missing redeploy metadata.
 
 Backup exports include apps, settings, managed deployment records, redeploy metadata, managed deployment files, discovered Docker Compose project files, and readable Docker bind mount or named volume data. By default, the backup scans all local Docker containers so Dockge-managed stacks and manually started containers can be included in the same bundle. Set `BACKUP_DOCKER_SCOPE=managed` to only include deployments created by The Containers. See [docs/migration-checklist.md](docs/migration-checklist.md) before moving The Containers to a new host.
+
+Restore first previews the exact host files and named-volume destinations for confirmation. It validates every file before changing records, rejects symbolic links and conflicting destinations, and limits project files to the configured deployments directory, locally discovered Compose directories, or declared bind mounts. On a new host, map project files into an approved directory before restoring. The confirmation expires after ten minutes; API clients must call `POST /api/backup/restore/preview` with the backup, then send the same backup to `POST /api/backup/restore` with the returned `confirmation` in the `X-Backup-Confirmation` header.
+
+Restore stages all host and named-volume files before replacing destinations, keeps originals for rollback, and commits database changes after the files are applied. Failed file application or database transactions restore the originals. Responses include `restore.database` and `restore.files`; `restore.files: "partial"` includes `rollbackErrors` with retained-original locations for manual recovery. Cleanup failures are warnings after a successful commit. Only one restore runs at a time. Stop workloads that write to restored data before restoring: this rollback handles operation errors, not concurrent application writes or process/host crashes across filesystem and database changes.
+
+New backups include file permission bits and numeric UID/GID. Restore attempts ownership without elevation and reports warnings when it is not permitted. Legacy backups without this metadata use mode `0600` and retain existing ownership (new files belong to the service user). Named-volume restores use `docker cp -a`; a failed volume restore never writes to its recorded host source as a fallback. File permissions cover `0777` bits; special bits and directory metadata are not archived.
+
+Preview and restore accept the configured Docker data cap plus two 5 MiB file budgets, base64 expansion, and 16 MiB of JSON metadata. Other routes keep their normal body limit. Compose project file exports now share a 5 MiB total budget.
 
 ## Important Safety Model
 

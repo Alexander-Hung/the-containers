@@ -325,9 +325,7 @@ function coerceDeploymentBackup(input: unknown) {
 
   return {
     appId: stringValue(firstValue(record, ['appId', 'app_id', 'app'])) ?? '',
-    provider: firstValue(record, ['provider', 'type']) === 'docker_compose'
-      ? 'docker_compose'
-      : 'docker',
+    provider: firstValue(record, ['provider', 'type']),
     resourceId:
       stringValue(firstValue(record, ['resourceId', 'resource_id', 'id', 'path'])) ??
       '',
@@ -703,6 +701,17 @@ export class AppsService {
 
   async importApps(input: unknown) {
     const apps = this.prepareImportedApps(input);
+    const importedIds = new Set(apps.map((app) => app.id));
+    const removedManagedApps = this.repo.findAll().filter(
+      (app) => app.managedDeployment && !importedIds.has(app.id)
+    );
+
+    if (removedManagedApps.length > 0) {
+      throw new AppConflictError(
+        `Import would remove managed apps: ${removedManagedApps.map((app) => `${app.name} (${app.id})`).join(', ')}. Include them in the import or delete them through the managed app delete flow first.`
+      );
+    }
+
     const savedApps = this.repo.replaceAll(apps);
     const proxySync = await this.proxyService.syncSafely();
 

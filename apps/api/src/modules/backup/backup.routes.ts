@@ -1,10 +1,12 @@
 import type { FastifyInstance } from 'fastify';
+import { createHash, randomBytes } from 'node:crypto';
+import { constants } from 'node:fs';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { ZodError } from 'zod';
+import { z, ZodError } from 'zod';
 import { config } from '../../config.js';
 import { AppConflictError, type AppsService } from '../apps/apps.service.js';
 import type { AuditService } from '../audit/audit.service.js';
@@ -15,6 +17,9 @@ type BackupFile = {
   encoding: 'base64';
   content: string;
   size: number;
+  mode?: number;
+  uid?: number;
+  gid?: number;
 };
 
 type DockerMountArchive = {
@@ -63,6 +68,9 @@ const maxBackupFileSize = 1024 * 1024;
 const maxBackupFilesTotalSize = 5 * 1024 * 1024;
 const maxDockerDataFileSize = Number(process.env.BACKUP_DOCKER_DATA_MAX_FILE_BYTES ?? 25 * 1024 * 1024);
 const maxDockerDataTotalSize = Number(process.env.BACKUP_DOCKER_DATA_MAX_TOTAL_BYTES ?? 256 * 1024 * 1024);
+// Base64 expansion for deployment files, project files and Docker data, plus
+// 16 MiB for JSON keys, paths, app/settings records and archive metadata.
+const restoreBodyLimit = Math.ceil((2 * maxBackupFilesTotalSize + maxDockerDataTotalSize) / 3) * 4 + 16 * 1024 * 1024;
 const execFileAsync = promisify(execFile);
 
 function safeRelativePath(value: string) {
@@ -72,13 +80,6 @@ function safeRelativePath(value: string) {
     !value.includes('\0') &&
     !value.split(/[\\/]+/).includes('..')
   );
-}
-
-function safeDeploymentTarget(relativePath: string) {
-  const root = path.resolve(config.deploymentsPath);
-  const target = path.resolve(root, relativePath);
-
-  return target.startsWith(`${root}${path.sep}`) ? target : null;
 }
 
 async function collectDeploymentFiles() {
@@ -119,7 +120,10 @@ async function collectDeploymentFiles() {
         path: relativePath,
         encoding: 'base64',
         content: content.toString('base64'),
-        size: stat.size
+        size: stat.size,
+        mode: stat.mode & 0o777,
+        uid: stat.uid,
+        gid: stat.gid
       });
     }
   }
@@ -310,7 +314,10 @@ async function collectFilesFromPath(
         path: relativePath,
         encoding: 'base64',
         content: content.toString('base64'),
-        size: stat.size
+        size: stat.size,
+        mode: stat.mode & 0o777,
+        uid: stat.uid,
+        gid: stat.gid
       });
     }
   }
@@ -383,6 +390,7 @@ async function collectDockerProjectFiles(
 ) {
   const files: DockerProjectFile[] = [];
   const seen = new Set<string>();
+  let totalSize = 0;
 
   for (const { container } of containers) {
     for (const filePath of containerComposeConfigFiles(container)) {
@@ -397,12 +405,13 @@ async function collectDockerProjectFiles(
       try {
         const stat = await fs.stat(resolved);
 
-        if (!stat.isFile() || stat.size > maxBackupFileSize) {
+        if (!stat.isFile() || stat.size > maxBackupFileSize || totalSize + stat.size > maxBackupFilesTotalSize) {
           continue;
         }
 
         const content = await fs.readFile(resolved);
 
+        totalSize += stat.size;
         files.push({
           path: path.basename(resolved),
           absolutePath: resolved,
@@ -410,7 +419,10 @@ async function collectDockerProjectFiles(
           container: containerName(container),
           encoding: 'base64',
           content: content.toString('base64'),
-          size: stat.size
+          size: stat.size,
+          mode: stat.mode & 0o777,
+          uid: stat.uid,
+          gid: stat.gid
         });
       } catch {
         continue;
@@ -477,231 +489,335 @@ async function collectDockerDataArchives(
   return archives;
 }
 
-async function restoreDockerProjectFiles(files: unknown) {
-  if (!Array.isArray(files)) {
-    return 0;
-  }
+class InvalidBackupError extends Error {}
 
-  let restored = 0;
-
-  for (const file of files) {
-    if (!file || typeof file !== 'object') {
-      continue;
-    }
-
-    const input = file as Partial<DockerProjectFile>;
-
-    if (
-      typeof input.absolutePath !== 'string' ||
-      !path.isAbsolute(input.absolutePath) ||
-      input.encoding !== 'base64' ||
-      typeof input.content !== 'string'
-    ) {
-      continue;
-    }
-
-    await fs.mkdir(path.dirname(input.absolutePath), { recursive: true });
-    await fs.writeFile(input.absolutePath, Buffer.from(input.content, 'base64'), { mode: 0o600 });
-    restored += 1;
-  }
-
-  return restored;
+function hasControlCharacters(value: string) {
+  return [...value].some((character) => character.charCodeAt(0) < 32);
 }
 
-async function writeBackupFilesToRoot(root: string, files: BackupFile[]) {
-  let restored = 0;
-  const resolvedRoot = path.resolve(root);
+const backupFileSchema = z.object({
+  path: z.string().min(1).refine((value) => Boolean(safeRelativePath(value)) && value !== '.' && !hasControlCharacters(value)),
+  encoding: z.literal('base64'),
+  content: z.string().refine((value) => Buffer.from(value, 'base64').toString('base64') === value, 'Invalid base64 content'),
+  size: z.number().int().nonnegative(),
+  mode: z.number().int().min(0).max(0o777).optional(),
+  uid: z.number().int().min(0).max(0xfffffffe).optional(),
+  gid: z.number().int().min(0).max(0xfffffffe).optional()
+}).refine((file) => Buffer.byteLength(file.content, 'base64') === file.size, 'File size does not match content');
+const absolutePathSchema = z.string().refine((value) => path.isAbsolute(value) && !hasControlCharacters(value));
+const restoreManifestSchema = z.object({
+  apps: z.array(z.unknown()),
+  deployments: z.array(z.unknown()).optional(),
+  settings: z.unknown().optional(),
+  deploymentFiles: z.array(backupFileSchema).default([]),
+  dockerProjectFiles: z.array(z.object({
+    absolutePath: absolutePathSchema,
+    // File validation is shared with deployment and mount entries.
+  }).passthrough().and(backupFileSchema)).default([]),
+  dockerDataArchives: z.array(z.object({
+    type: z.enum(['bind', 'volume']),
+    source: absolutePathSchema,
+    name: z.string().nullable().optional(),
+    files: z.array(backupFileSchema)
+  }).refine((archive) => archive.type !== 'volume' || Boolean(archive.name?.match(/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/)), 'Invalid volume name')).default([])
+});
+type RestoreManifest = z.infer<typeof restoreManifestSchema>;
 
-  for (const file of files) {
-    if (!safeRelativePath(file.path)) {
-      continue;
-    }
-
-    const target = path.resolve(resolvedRoot, file.path);
-
-    if (!target.startsWith(`${resolvedRoot}${path.sep}`)) {
-      continue;
-    }
-
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, Buffer.from(file.content, 'base64'), { mode: 0o600 });
-    restored += 1;
-  }
-
-  return restored;
+function withinRoot(root: string, target: string) {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  return relative !== '' && !path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`);
 }
 
-async function restoreNamedVolume(name: string, files: BackupFile[]) {
-  const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'the-containers-volume-restore-'));
-  const helperName = `the-containers-restore-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-  try {
-    await writeBackupFilesToRoot(tmpRoot, files);
-    await runDocker(['volume', 'create', name]);
-
-    try {
-      await runDocker(['create', '--name', helperName, '-v', `${name}:/restore`, 'busybox:latest', 'sh']);
-    } catch {
-      await runDocker(['pull', 'busybox:latest']);
-      await runDocker(['create', '--name', helperName, '-v', `${name}:/restore`, 'busybox:latest', 'sh']);
+async function validateHostTarget(target: string) {
+  // Check every existing component, including the final file and the approved root.
+  // Missing components are allowed, but links never establish an approved destination.
+  let current = path.parse(target).root;
+  const parts = target.slice(current.length).split(path.sep).filter(Boolean);
+  for (const [index, part] of parts.entries()) {
+    current = path.join(current, part);
+    const stat = await fs.lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (!stat) continue;
+    if (stat.isSymbolicLink() || (index < parts.length - 1 && !stat.isDirectory()) ||
+        (index === parts.length - 1 && (!stat.isFile() || stat.nlink > 1))) {
+      throw new InvalidBackupError(`Unsafe restore destination: ${current}`);
     }
-
-    await runDocker(['cp', `${tmpRoot}${path.sep}.`, `${helperName}:/restore`]);
-    return files.length;
-  } finally {
-    await runDocker(['rm', '-f', helperName]).catch(() => undefined);
-    await fs.rm(tmpRoot, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
-function backupFilesFromUnknown(files: unknown) {
-  if (!Array.isArray(files)) {
-    return [];
+async function validateRestoreManifest(body: unknown, appsService: AppsService) {
+  const manifest = restoreManifestSchema.parse(body);
+  const roots = [path.resolve(config.deploymentsPath)];
+  if (manifest.dockerProjectFiles.length) {
+    const containers = await discoverBackupContainers(appsService.exportDeployments(), appsService.exportApps().apps);
+    roots.push(...containers.flatMap(({ container }) => containerComposeConfigFiles(container).map((file) => path.dirname(file))));
   }
-
-  return files.flatMap((file) => {
-    if (!file || typeof file !== 'object') {
-      return [];
-    }
-
-    const input = file as Partial<BackupFile>;
-
-    if (
-      typeof input.path !== 'string' ||
-      input.encoding !== 'base64' ||
-      typeof input.content !== 'string' ||
-      typeof input.size !== 'number' ||
-      !safeRelativePath(input.path)
-    ) {
-      return [];
-    }
-
-    return [{
-      path: input.path,
-      encoding: input.encoding,
-      content: input.content,
-      size: input.size
-    }];
-  });
-}
-
-async function restoreMountArchive(input: Partial<DockerMountArchive>) {
-  const files = backupFilesFromUnknown(input.files);
-
-  if (files.length === 0) {
-    return 0;
+  // Declared bind roots are visible in the preview and require a separate confirmation.
+  roots.push(...manifest.dockerDataArchives.filter((archive) => archive.type === 'bind').map((archive) => path.resolve(archive.source)));
+  if (roots.some((root) => root === path.parse(root).root)) {
+    throw new InvalidBackupError('A filesystem root cannot be a restore destination');
   }
-
-  if (input.type === 'volume' && typeof input.name === 'string' && input.name) {
-    try {
-      return await restoreNamedVolume(input.name, files);
-    } catch {
-      if (typeof input.source !== 'string' || !path.isAbsolute(input.source)) {
-        return 0;
+  const destinations: string[] = [];
+  const hostTargets = new Map<string, string>();
+  async function addTarget(target: string, file: BackupFile) {
+    const contents = JSON.stringify([file.content, file.mode, file.uid, file.gid]);
+    // Managed compose files can legitimately appear in both export sections.
+    if (hostTargets.get(target) === contents) return;
+    if (hostTargets.has(target) || [...hostTargets.keys()].some((other) => withinRoot(other, target) || withinRoot(target, other))) {
+      throw new InvalidBackupError(`Conflicting restore destination: ${target}`);
+    }
+    await validateHostTarget(target);
+    hostTargets.set(target, contents);
+    destinations.push(target);
+  }
+  for (const file of manifest.deploymentFiles) {
+    const target = path.resolve(config.deploymentsPath, file.path);
+    if (!withinRoot(config.deploymentsPath, target)) throw new InvalidBackupError(`Invalid deployment path: ${file.path}`);
+    await addTarget(target, file);
+  }
+  for (const file of manifest.dockerProjectFiles) {
+    const target = path.resolve(file.absolutePath);
+    if (!roots.some((root) => withinRoot(root, target))) throw new InvalidBackupError(`Unapproved project destination: ${target}`);
+    await addTarget(target, file);
+  }
+  const volumeTargets = new Set<string>();
+  for (const archive of manifest.dockerDataArchives) {
+    for (const file of archive.files) {
+      const target = path.resolve(archive.source, file.path);
+      if (!withinRoot(archive.source, target)) throw new InvalidBackupError(`Invalid mount path: ${file.path}`);
+      if (archive.type === 'bind') await addTarget(target, file);
+      else {
+        const destination = `volume:${archive.name}/${path.posix.normalize(file.path)}`;
+        if ([...volumeTargets].some((other) => other === destination || other.startsWith(`${destination}/`) || destination.startsWith(`${other}/`))) {
+          throw new InvalidBackupError(`Conflicting volume destination: ${destination}`);
+        }
+        volumeTargets.add(destination);
+        destinations.push(destination);
       }
     }
   }
-
-  if (typeof input.source !== 'string' || !path.isAbsolute(input.source)) {
-    return 0;
-  }
-
-  return restoreFilesToRoot(input.source, files);
+  return { manifest, destinations };
 }
 
-async function restoreDeploymentFiles(files: unknown) {
-  if (!Array.isArray(files)) {
-    return 0;
+async function writeBackupFile(target: string, file: BackupFile, warnings: string[]) {
+  await validateHostTarget(target);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await validateHostTarget(target);
+  const handle = await fs.open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+  try {
+    if ((await handle.stat()).nlink > 1) throw new InvalidBackupError(`Hard-linked restore destination: ${target}`);
+    await handle.truncate(0);
+    await handle.writeFile(Buffer.from(file.content, 'base64'));
+    if (file.uid !== undefined && file.gid !== undefined) {
+      try {
+        await handle.chown(file.uid, file.gid);
+      } catch (error) {
+        warnings.push(`Could not restore ownership ${file.uid}:${file.gid} for ${target}: ${(error as NodeJS.ErrnoException).code ?? 'unknown error'}`);
+      }
+    }
+    // Apply permissions after ownership (chown can clear special mode bits).
+    await handle.chmod(file.mode ?? 0o600);
+  } finally {
+    await handle.close();
   }
-
-  let restored = 0;
-
-  for (const file of files) {
-    if (!file || typeof file !== 'object') {
-      continue;
-    }
-
-    const input = file as Partial<BackupFile>;
-
-    if (
-      typeof input.path !== 'string' ||
-      input.encoding !== 'base64' ||
-      typeof input.content !== 'string' ||
-      !safeRelativePath(input.path)
-    ) {
-      continue;
-    }
-
-    const target = safeDeploymentTarget(input.path);
-
-    if (!target) {
-      continue;
-    }
-
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, Buffer.from(input.content, 'base64'), { mode: 0o600 });
-    restored += 1;
-  }
-
-  return restored;
 }
 
-async function restoreFilesToRoot(root: string, files: unknown) {
-  if (!Array.isArray(files)) {
-    return 0;
-  }
-
-  let restored = 0;
-  const resolvedRoot = path.resolve(root);
-
-  for (const file of files) {
-    if (!file || typeof file !== 'object') {
-      continue;
-    }
-
-    const input = file as Partial<BackupFile>;
-
-    if (
-      typeof input.path !== 'string' ||
-      input.encoding !== 'base64' ||
-      typeof input.content !== 'string' ||
-      !safeRelativePath(input.path)
-    ) {
-      continue;
-    }
-
-    const target = path.resolve(resolvedRoot, input.path);
-
-    if (!target.startsWith(`${resolvedRoot}${path.sep}`)) {
-      continue;
-    }
-
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, Buffer.from(input.content, 'base64'), { mode: 0o600 });
-    restored += 1;
-  }
-
-  return restored;
+async function writeBackupFilesToRoot(root: string, files: BackupFile[], warnings: string[]) {
+  for (const file of files) await writeBackupFile(path.resolve(root, file.path), file, warnings);
+  return files.length;
 }
 
-async function restoreDockerDataArchives(archives: unknown) {
-  if (!Array.isArray(archives)) {
-    return 0;
-  }
+type StagedHostFile = {
+  target: string;
+  directory: string;
+  originalMoved: boolean;
+  installed: boolean;
+};
+type StagedVolume = { name: string; helper: string; directory: string; files: BackupFile[]; ready: boolean };
 
-  let restored = 0;
+// Runs in the helper with positional arguments, never interpolated archive paths.
+// Journal entries and originals live on the destination filesystem, so each
+// replacement and its undo use rename rather than an in-place overwrite.
+const volumeFileStep = `
+set -eu
+phase=$1; root=$2; work=$3; shift 3
+safe_target() {
+  current=$root
+  remaining=$1
+  while :; do
+    component=\${remaining%%/*}
+    current=$current/$component
+    [ ! -L "$current" ] || { echo "Symlink destination: $current" >&2; exit 1; }
+    if [ "$remaining" = "$component" ]; then
+      if [ -e "$current" ]; then
+        [ -f "$current" ] && [ "$(stat -c %h "$current")" = 1 ] || exit 1
+      fi
+      break
+    fi
+    [ ! -e "$current" ] || [ -d "$current" ] || exit 1
+    remaining=\${remaining#*/}
+  done
+}
+i=0
+while [ "$#" -gt 0 ]; do
+  relative=$1; ownership=$2; shift 2
+  entry=$work/$i
+  target=$root/$relative
+  case "$phase" in
+    stage)
+      safe_target "$relative"
+      mkdir -p "\${target%/*}"
+      mkdir "$entry"
+      # Preflight destination-directory writes on the same filesystem.
+      probe=$(mktemp "\${target%/*}/.restore-probe.XXXXXX")
+      rm "$probe"
+      if [ ! -e "$target" ]; then
+        touch "$entry/absent"
+      elif [ "$ownership" = preserve ]; then
+        chown "$(stat -c %u "$target"):$(stat -c %g "$target")" "$work/new/$relative" ||
+          echo "Could not preserve ownership for $target" >&2
+      fi
+      ;;
+    apply)
+      safe_target "$relative"
+      if [ -e "$target" ]; then mv "$target" "$entry/original"; fi
+      mv "$work/new/$relative" "$target"
+      ;;
+    rollback)
+      safe_target "$relative"
+      if [ -e "$entry/original" ]; then
+        mv "$entry/original" "$target"
+      elif [ -e "$entry/absent" ] && [ ! -e "$work/new/$relative" ]; then
+        rm -f "$target"
+      fi
+      ;;
+  esac
+  i=$((i + 1))
+done
+`;
 
-  for (const archive of archives) {
-    if (!archive || typeof archive !== 'object') {
-      continue;
+class RestoreFilesTransaction {
+  private hosts: StagedHostFile[] = [];
+  private volumes: StagedVolume[] = [];
+  private localTemps: string[] = [];
+
+  constructor(private warnings: string[]) {}
+
+  async stage(body: RestoreManifest) {
+    const targets = new Map<string, BackupFile>();
+    for (const file of body.deploymentFiles) targets.set(path.resolve(config.deploymentsPath, file.path), file);
+    for (const file of body.dockerProjectFiles) targets.set(path.resolve(file.absolutePath), file);
+    for (const archive of body.dockerDataArchives.filter((archive) => archive.type === 'bind')) {
+      for (const file of archive.files) targets.set(path.resolve(archive.source, file.path), file);
     }
-
-    const input = archive as Partial<DockerMountArchive>;
-
-    restored += await restoreMountArchive(input);
+    for (const [target, file] of targets) {
+      await validateHostTarget(target);
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await validateHostTarget(target);
+      const directory = await fs.mkdtemp(path.join(path.dirname(target), '.the-containers-restore-'));
+      this.hosts.push({ target, directory, originalMoved: false, installed: false });
+      const previous = await fs.lstat(target).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      await writeBackupFile(path.join(directory, 'new'), {
+        ...file,
+        // Rename replaces the inode: explicitly preserve legacy ownership.
+        uid: file.uid !== undefined && file.gid !== undefined ? file.uid : previous?.uid,
+        gid: file.uid !== undefined && file.gid !== undefined ? file.gid : previous?.gid
+      }, this.warnings);
+    }
+    // Stage every volume's payload without copying over its live files.
+    for (const archive of body.dockerDataArchives.filter((archive) => archive.type === 'volume' && archive.files.length)) {
+      const tmp = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'the-containers-volume-restore-')));
+      this.localTemps.push(tmp);
+      await writeBackupFilesToRoot(tmp, archive.files, this.warnings);
+      const suffix = randomBytes(12).toString('hex');
+      const volume: StagedVolume = {
+        name: archive.name!, helper: `the-containers-restore-${suffix}`,
+        directory: `/restore/.the-containers-restore-${suffix}`, files: archive.files, ready: false
+      };
+      this.volumes.push(volume);
+      await runDocker(['volume', 'create', volume.name]);
+      const create = ['create', '--name', volume.helper, '-v', `${volume.name}:/restore`,
+        '--entrypoint', 'sh', 'busybox:latest', '-c', 'while :; do sleep 3600; done'];
+      try { await runDocker(create); }
+      catch {
+        await runDocker(['pull', 'busybox:latest']);
+        await runDocker(create);
+      }
+      await runDocker(['start', volume.helper]);
+      await runDocker(['exec', volume.helper, 'mkdir', volume.directory]);
+      await runDocker(['exec', volume.helper, 'mkdir', `${volume.directory}/new`]);
+      await runDocker(['cp', '-a', `${tmp}${path.sep}.`, `${volume.helper}:${volume.directory}/new`]);
+      await this.volumeStep(volume, 'stage');
+      volume.ready = true;
+    }
   }
 
-  return restored;
+  private async volumeStep(volume: StagedVolume, phase: string) {
+    const { stderr } = await runDocker(['exec', volume.helper, 'sh', '-c', volumeFileStep, 'restore-files',
+      phase, '/restore', volume.directory, ...volume.files.flatMap((file) => [
+        path.posix.normalize(file.path), file.uid !== undefined && file.gid !== undefined ? 'archive' : 'preserve'
+      ])]);
+    if (stderr.trim()) this.warnings.push(stderr.trim());
+  }
+
+  async apply() {
+    for (const entry of this.hosts) {
+      await validateHostTarget(entry.target);
+      try {
+        await fs.rename(entry.target, path.join(entry.directory, 'original'));
+        entry.originalMoved = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      await fs.rename(path.join(entry.directory, 'new'), entry.target);
+      entry.installed = true;
+    }
+    for (const volume of this.volumes) await this.volumeStep(volume, 'apply');
+  }
+
+  async rollback() {
+    const failures: string[] = [];
+    for (const volume of [...this.volumes].reverse()) {
+      if (!volume.ready) continue;
+      try { await this.volumeStep(volume, 'rollback'); }
+      catch (error) { failures.push(`volume:${volume.name}: ${String(error)}; originals: ${volume.directory}`); }
+    }
+    for (const entry of [...this.hosts].reverse()) {
+      try {
+        await validateHostTarget(entry.target);
+        if (entry.originalMoved) await fs.rename(path.join(entry.directory, 'original'), entry.target);
+        else if (entry.installed) await fs.unlink(entry.target);
+      } catch (error) { failures.push(`${entry.target}: ${String(error)}; originals: ${entry.directory}`); }
+    }
+    return failures;
+  }
+
+  async cleanup(keepOriginals = false) {
+    // A failed rollback must leave its journal/originals available for recovery.
+    for (const volume of this.volumes) {
+      if (!keepOriginals) {
+        await runDocker(['exec', volume.helper, 'rm', '-rf', volume.directory])
+          .catch((error) => this.warnings.push(`Could not clean volume staging ${volume.name}:${volume.directory}: ${String(error)}`));
+      }
+      await runDocker(['rm', '-f', volume.helper])
+        .catch((error) => this.warnings.push(`Could not remove restore helper ${volume.helper}: ${String(error)}`));
+    }
+    if (!keepOriginals) {
+      for (const entry of this.hosts) {
+        await fs.rm(entry.directory, { recursive: true, force: true })
+          .catch((error) => this.warnings.push(`Could not clean staging ${entry.directory}: ${String(error)}`));
+      }
+    }
+    for (const tmp of this.localTemps) {
+      await fs.rm(tmp, { recursive: true, force: true })
+        .catch((error) => this.warnings.push(`Could not clean staging ${tmp}: ${String(error)}`));
+    }
+  }
 }
 
 function extractBackupBody(input: unknown) {
@@ -762,7 +878,7 @@ export async function registerBackupRoutes(
 
     return {
       exportedAt: new Date().toISOString(),
-      version: 5,
+      version: 6,
       kind: 'the-containers-backup',
       apps,
       deployments,
@@ -778,45 +894,98 @@ export async function registerBackupRoutes(
     };
   });
 
-  app.post('/api/backup/restore', async (request, reply) => {
-    const body = extractBackupBody(request.body) as {
-      apps?: unknown[];
-      deployments?: unknown[];
-      deploymentFiles?: unknown[];
-      dockerProjectFiles?: unknown[];
-      dockerDataArchives?: unknown[];
-      settings?: unknown;
-    };
+  const confirmations = new Map<string, { digest: string; expires: number }>();
+  const digest = (body: unknown) => createHash('sha256').update(JSON.stringify(body)).digest('hex');
 
-    if (!body?.apps || !Array.isArray(body.apps)) {
-      return reply.code(400).send({ message: 'Backup file does not contain apps.' });
-    }
-
+  app.post('/api/backup/restore/preview', { bodyLimit: restoreBodyLimit }, async (request, reply) => {
     try {
-      const result = await appsService.restoreBackup({
-        apps: body.apps,
-        deployments: body.deployments,
-        settings: body.settings,
-        settingsService,
-        adminTokenConfigured: Boolean(config.adminToken)
-      });
-      const deploymentFiles = await restoreDeploymentFiles(body.deploymentFiles);
-      const dockerProjectFiles = await restoreDockerProjectFiles(body.dockerProjectFiles);
-      const dockerDataFiles = await restoreDockerDataArchives(body.dockerDataArchives);
-      auditService.record({
-        action: 'backup.restore',
-        targetType: 'backup',
-        summary: `Restored ${body.apps.length} apps, ${deploymentFiles} deployment files, ${dockerProjectFiles} Docker project files, and ${dockerDataFiles} Docker data files`,
-        sourceIp: request.ip
-      });
+      const body = extractBackupBody(request.body);
+      const { destinations } = await validateRestoreManifest(body, appsService);
+      for (const [token, entry] of confirmations) {
+        if (entry.expires < Date.now()) confirmations.delete(token);
+      }
+      if (confirmations.size >= 20) confirmations.delete(confirmations.keys().next().value!);
+      const confirmation = randomBytes(32).toString('hex');
+      confirmations.set(confirmation, { digest: digest(body), expires: Date.now() + 10 * 60_000 });
+      return { destinations, confirmation };
+    } catch (error) {
+      if (error instanceof ZodError || error instanceof InvalidBackupError) {
+        return reply.code(400).send({ message: error.message });
+      }
+      throw error;
+    }
+  });
+
+  let restoring = false;
+  app.post('/api/backup/restore', { bodyLimit: restoreBodyLimit }, async (request, reply) => {
+    if (restoring) return reply.code(409).send({ message: 'Another backup restore is in progress' });
+    restoring = true;
+    const rawBody = extractBackupBody(request.body);
+    try {
+      const { manifest: body, destinations } = await validateRestoreManifest(rawBody, appsService);
+      if (destinations.length) {
+        const token = request.headers['x-backup-confirmation'];
+        const confirmation = typeof token === 'string' ? confirmations.get(token) : undefined;
+        if (!confirmation || confirmation.expires < Date.now() || confirmation.digest !== digest(rawBody)) {
+          throw new InvalidBackupError('Preview and confirm this backup before restoring files');
+        }
+        confirmations.delete(token as string);
+      }
+      const warnings: string[] = [];
+      const allFiles = [...body.deploymentFiles, ...body.dockerProjectFiles, ...body.dockerDataArchives.flatMap((archive) => archive.files)];
+      if (allFiles.some((file) => file.mode === undefined || file.uid === undefined || file.gid === undefined)) {
+        warnings.push('Some files have no permission or ownership metadata (legacy backup); missing modes default to 0600 and missing ownership is unchanged (new files belong to the service user).');
+      }
+      const files = new RestoreFilesTransaction(warnings);
+      let result: Awaited<ReturnType<AppsService['restoreBackup']>>;
+      try {
+        await files.stage(body);
+        await files.apply();
+        result = await appsService.restoreBackup({
+          apps: body.apps,
+          deployments: body.deployments,
+          settings: body.settings,
+          settingsService,
+          adminTokenConfigured: Boolean(config.adminToken)
+        });
+      } catch (error) {
+        const rollbackErrors = await files.rollback();
+        await files.cleanup(rollbackErrors.length > 0);
+        const status = rollbackErrors.length ? 500 : error instanceof ZodError || error instanceof InvalidBackupError
+          ? 400 : error instanceof AppConflictError ? 409 : 500;
+        return reply.code(status).send({
+          message: error instanceof Error ? error.message : String(error),
+          restore: { database: 'unchanged', files: rollbackErrors.length ? 'partial' : 'rolled_back', rollbackErrors },
+          warnings
+        });
+      }
+      await files.cleanup();
+      const deploymentFiles = body.deploymentFiles.length;
+      const dockerProjectFiles = body.dockerProjectFiles.length;
+      const dockerDataFiles = body.dockerDataArchives.reduce((sum, archive) => sum + archive.files.length, 0);
+      try {
+        auditService.record({
+          action: 'backup.restore',
+          targetType: 'backup',
+          summary: `Restored ${body.apps.length} apps, ${deploymentFiles} deployment files, ${dockerProjectFiles} Docker project files, and ${dockerDataFiles} Docker data files`,
+          sourceIp: request.ip
+        });
+      } catch (error) {
+        warnings.push(`Restore committed, but audit recording failed: ${String(error)}`);
+      }
 
       return {
         ...result,
+        restore: { database: 'committed', files: 'committed' },
         deploymentFiles,
         dockerProjectFiles,
-        dockerDataFiles
+        dockerDataFiles,
+        warnings
       };
     } catch (error) {
+      if (error instanceof InvalidBackupError) {
+        return reply.code(400).send({ message: error.message });
+      }
       if (error instanceof ZodError) {
         return reply.code(400).send({
           message: 'Invalid backup input',
@@ -829,6 +998,8 @@ export async function registerBackupRoutes(
       }
 
       throw error;
+    } finally {
+      restoring = false;
     }
   });
 

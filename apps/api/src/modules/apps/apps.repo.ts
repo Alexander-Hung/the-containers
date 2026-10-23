@@ -193,7 +193,31 @@ export class AppsRepo {
   }
 
   replaceAll(apps: AppRecord[]) {
-    return this.db.transaction(() => this.replaceAllInCurrentTransaction(apps))();
+    return this.db.transaction(() => {
+      const importedIds = new Set(apps.map((app) => app.id));
+      const existingIds = new Set(this.findAll().map((app) => app.id));
+      const releaseSlug = this.db.prepare('UPDATE apps SET slug = ? WHERE id = ?');
+
+      for (const id of existingIds) {
+        if (!importedIds.has(id)) {
+          this.delete(id);
+        } else {
+          // Allow slug swaps without deleting retained rows and cascading their metadata.
+          // Imported slugs are normalized and cannot contain this underscore prefix.
+          releaseSlug.run(`__import_${nanoid()}`, id);
+        }
+      }
+
+      for (const app of apps) {
+        if (existingIds.has(app.id)) {
+          this.update(app.id, app);
+        } else {
+          this.create(app);
+        }
+      }
+
+      return this.findAll();
+    })();
   }
 
   recordHealthChecks(statuses: AppStatus[]) {
